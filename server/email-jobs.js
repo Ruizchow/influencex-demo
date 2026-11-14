@@ -1,0 +1,308 @@
+/**
+ * Background email-send handlers registered on the shared job queue.
+ *
+ * Exposes three job types:
+ *   email.send         — send a single contact's draft, record event, update status
+ *   email.batch_send   — expand to N email.send jobs for a set of contact ids
+ *   email.sync_status  — safety-net sweep: mark contacts queued for >30m as failed
+ *
+ * Each handler takes (job) where job.payload contains the work. The handler
+ * *throws* on transient failure to let the queue retry; terminal errors are
+ * persisted and return normally.
+ */
+
+const { v4: uuidv4 } = require('uuid');
+const secrets = require('./secrets');
+const log = require('./logger');
+
+function register({ jobQueue, query, queryOne, exec, mailAgent }) {
+  async function resolveMailbox(contact) {
+    if (!contact.mailbox_account_id) {
+      // try workspace default
+      if (contact.workspace_id) {
+        return await queryOne(
+          'SELECT * FROM mailbox_accounts WHERE workspace_id = ? AND is_default = 1 AND status = \'active\' ORDER BY created_at ASC LIMIT 1',
+          [contact.workspace_id]
+        );
+      }
+      return null;
+    }
+    return await queryOne(
+      'SELECT * FROM mailbox_accounts WHERE id = ? AND status = \'active\'',
+      [contact.mailbox_account_id]
+    );
+  }
+
+  async function recordEvent({ workspaceId, contactId, providerMessageId, eventType, payload }) {
+    try {
+      await exec(
+        `INSERT INTO email_events (id, workspace_id, contact_id, provider_message_id, event_type, payload)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [uuidv4(), workspaceId || null, contactId || null, providerMessageId || null, eventType, JSON.stringify(payload || {})]
+      );
+    } catch (e) {
+      log.warn('[email-jobs] failed to record event:', e.message);
+    }
+  }
+
+  // ---- email.send ----
+  // payload: { contactId, toOverride?, subjectOverride?, bodyOverride?, kind?, followUpStep? }
+  // kind='followup' skips the "already sent" short-circuit so follow-ups
+  // can be enqueued against contacts in status='sent' / 'delivered' / 'opened';
+  // followUpStep (set by the scheduler) is the follow_up_count value this job
+  // claims via CAS before sending — the idempotency key for redeliveries.
+  jobQueue.register('email.send', async (job) => {
+    const { contactId, toOverride, subjectOverride, bodyOverride, kind, followUpStep: payloadStep } = job.payload || {};
+    if (!contactId) throw new Error('email.send requires contactId');
+
+    const contact = await queryOne(
+      `SELECT c.*, k.email as kol_email, k.display_name, k.username,
+              k.email_blocked_at, k.email_blocked_reason
+       FROM contacts c JOIN kols k ON c.kol_id = k.id
+       WHERE c.id = ?`,
+      [contactId]
+    );
+    if (!contact) {
+      // terminal: swallow, the contact was deleted.
+      return { skipped: 'contact not found' };
+    }
+    // Hard-bounce guardrail: if the KOL's email was previously flagged by the
+    // auto-disable logic (see webhook handler), refuse to send. The contact
+    // stays in a "failed" terminal state with a clear reason.
+    if (contact.email_blocked_at) {
+      await exec(
+        `UPDATE contacts SET status='failed', send_error=?, last_send_attempt_at=CURRENT_TIMESTAMP WHERE id=?`,
+        [`Recipient blocked: ${contact.email_blocked_reason || 'repeated hard bounces'}`, contactId]
+      );
+      return { failed: true, error: 'recipient_blocked' };
+    }
+    const isFollowUp = kind === 'followup';
+    if (!isFollowUp && ['sent', 'delivered', 'opened', 'replied', 'sending'].includes(contact.status)) {
+      return { skipped: `already ${contact.status}` };
+    }
+
+    // ---- Atomic claim ----
+    // A redelivered job (worker crash mid-send, retry after a post-send DB
+    // error) or a concurrent worker must not double-send. Both paths flip a
+    // DB marker with a conditional UPDATE and proceed only if they actually
+    // claimed the row (affected rows === 1). Rows stranded in 'sending' by a
+    // crash are swept to 'failed' by email.sync_status below.
+    let followUpStep = null;
+    if (isFollowUp) {
+      // Follow-up N is idempotent on follow_up_count: CAS-bump N-1 → N
+      // *before* sending. A redelivered job sees the count already at N,
+      // loses the claim, and skips. Failure paths release the claim so a
+      // transient error can still retry.
+      followUpStep = Number.isInteger(payloadStep)
+        ? payloadStep
+        : (contact.follow_up_count || 0) + 1; // legacy jobs without the field
+      const claim = await exec(
+        `UPDATE contacts SET follow_up_count = ? WHERE id = ? AND COALESCE(follow_up_count, 0) = ?`,
+        [followUpStep, contactId, followUpStep - 1]
+      );
+      if ((claim.rowCount || 0) !== 1) {
+        return { skipped: `follow-up ${followUpStep} already claimed` };
+      }
+    } else {
+      const claim = await exec(
+        `UPDATE contacts SET status='sending' WHERE id = ? AND status IN ('draft', 'scheduled', 'pending', 'failed')`,
+        [contactId]
+      );
+      if ((claim.rowCount || 0) !== 1) {
+        return { skipped: `not claimable (was ${contact.status})` };
+      }
+    }
+
+    // Release a follow-up claim on any non-success exit so the queue's retry
+    // (transient) or a later tick (terminal) can claim step N again.
+    async function releaseFollowUpClaim() {
+      if (!isFollowUp) return;
+      try {
+        await exec(
+          `UPDATE contacts SET follow_up_count = ? WHERE id = ? AND COALESCE(follow_up_count, 0) = ?`,
+          [followUpStep - 1, contactId, followUpStep]
+        );
+      } catch (e) {
+        log.warn('[email-jobs] failed to release follow-up claim:', e.message);
+      }
+    }
+
+    const emailTo = toOverride || contact.kol_email;
+    if (!emailTo) {
+      await releaseFollowUpClaim();
+      await exec(
+        `UPDATE contacts SET status='failed', send_error='No recipient email', last_send_attempt_at=CURRENT_TIMESTAMP WHERE id=?`,
+        [contactId]
+      );
+      return { failed: true, error: 'no recipient' };
+    }
+
+    const subject = subjectOverride || contact.email_subject;
+    const body = bodyOverride || contact.email_body;
+    if (!subject || !body) {
+      await releaseFollowUpClaim();
+      await exec(
+        `UPDATE contacts SET status='failed', send_error='Empty subject/body', last_send_attempt_at=CURRENT_TIMESTAMP WHERE id=?`,
+        [contactId]
+      );
+      return { failed: true, error: 'empty subject/body' };
+    }
+
+    const mailbox = await resolveMailbox(contact);
+
+    // Dev fallback: with no provider configured we don't call out to anyone,
+    // but everything downstream still runs. This used to `return` early, which
+    // skipped the pipeline_jobs sync below — so on every provider-less
+    // deployment an approved job reached contacts.status='sent' while
+    // pipeline_jobs.stage stayed at 'send' forever, and the Pipeline page
+    // showed it stuck mid-flight with no thread row and no event.
+    const dryRun = !mailAgent.isConfigured() && !mailbox;
+    if (dryRun) {
+      // Everything below records a fully successful send, so this line is the
+      // only operator-facing signal that nothing actually went out. Nothing
+      // fails fast at boot without a mail provider (email.js isConfigured() is
+      // just a boolean), so this path is reachable in production — where it
+      // means outreach is silently going nowhere. Warn, don't swallow.
+      log.warn(
+        `[email-jobs] dry-run: no mail provider configured (RESEND_API_KEY / SMTP_* / mailbox account all absent) — contact ${contactId} will be marked sent without sending`
+      );
+    }
+
+    await exec(
+      `UPDATE contacts SET send_attempts = COALESCE(send_attempts, 0) + 1, last_send_attempt_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [contactId]
+    );
+
+    const result = dryRun
+      ? { success: true, messageId: null, provider: 'dry-run' }
+      : await mailAgent.sendEmail({
+        to: emailTo,
+        subject,
+        body,
+        mailboxAccount: mailbox,
+        // Persist refreshed Gmail tokens so the next send uses the new access_token
+        onCredsRefreshed: async (fresh) => {
+          if (!mailbox?.id) return;
+          try {
+            await exec(
+              'UPDATE mailbox_accounts SET credentials_encrypted = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+              [secrets.encrypt(fresh), mailbox.id]
+            );
+          } catch (e) {
+            log.warn('[email-jobs] failed to persist refreshed creds:', e.message);
+          }
+        },
+      });
+
+    if (!result.success) {
+      // Transient vs terminal distinction: network-ish errors -> throw to retry.
+      const err = result.error || 'Send failed';
+      const isTerminal = /invalid|missing|not configured|rejected|400|401|403|422/i.test(err);
+      // The send didn't happen — hand the follow-up step back so the retry
+      // (or a later tick) can claim it again.
+      await releaseFollowUpClaim();
+      await exec(
+        `UPDATE contacts SET status = ?, send_error = ? WHERE id = ?`,
+        [isTerminal ? 'failed' : 'pending', err.slice(0, 500), contactId]
+      );
+      // Sync pipeline_job if present: on terminal failure, bounce back to
+      // 'review' so the admin can edit/retry; on transient, stay at 'send'
+      // because the queue will retry automatically.
+      if (isTerminal) {
+        try {
+          await exec(
+            "UPDATE pipeline_jobs SET stage='review', error=?, updated_at=CURRENT_TIMESTAMP WHERE contact_id=?",
+            [err.slice(0, 500), contactId]
+          );
+        } catch (e) { log.warn('[email-jobs] pipeline failure sync:', e.message); }
+      }
+      await recordEvent({
+        workspaceId: contact.workspace_id,
+        contactId,
+        eventType: 'failed',
+        payload: { error: err, terminal: isTerminal },
+      });
+      if (!isTerminal) throw new Error(err); // let the queue retry
+      return { failed: true, error: err };
+    }
+
+    const fromEmail = mailbox?.from_email || process.env.RESEND_FROM_EMAIL || process.env.SMTP_USER || 'noreply@localhost';
+    // For follow-ups we don't regress the status, and follow_up_count was
+    // already bumped by the pre-send claim above — a throw from here on
+    // retries the job, whose claim then loses, so the provider send can't
+    // repeat. The contact stays in whatever engagement state it reached.
+    if (isFollowUp) {
+      await exec(
+        `UPDATE contacts SET send_error = NULL WHERE id = ?`,
+        [contactId]
+      );
+    } else {
+      await exec(
+        `UPDATE contacts SET status='sent', sent_at=CURRENT_TIMESTAMP, send_error=NULL, provider_message_id=? WHERE id=?`,
+        [result.messageId || null, contactId]
+      );
+    }
+
+    // If this contact was spawned from a pipeline_job (pipeline/review → approve
+    // path), sync the pipeline row so the Pipeline page reflects the send
+    // outcome. Silently skipped when the contact has no linked pipeline_job
+    // (i.e. the ContactModule direct-send path).
+    try {
+      await exec(
+        "UPDATE pipeline_jobs SET email_sent_at=CURRENT_TIMESTAMP, smtp_message_id=?, stage='monitor', updated_at=CURRENT_TIMESTAMP WHERE contact_id=?",
+        [result.messageId || null, contactId]
+      );
+    } catch (e) {
+      log.warn('[email-jobs] failed to sync pipeline_jobs stage:', e.message);
+    }
+
+    await exec(
+      `INSERT INTO email_replies (id, workspace_id, contact_id, direction, from_email, to_email, subject, body_text, resend_email_id, received_at)
+       VALUES (?, ?, ?, 'outbound', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+      [uuidv4(), contact.workspace_id || null, contactId, fromEmail, emailTo, subject, body, result.messageId || null]
+    );
+    await recordEvent({
+      workspaceId: contact.workspace_id,
+      contactId,
+      providerMessageId: result.messageId,
+      eventType: 'sent',
+      payload: { provider: result.provider, to: emailTo, dryRun: dryRun || undefined },
+    });
+
+    return { success: true, messageId: result.messageId, dryRun: dryRun || undefined };
+  });
+
+  // ---- email.batch_send ----
+  jobQueue.register('email.batch_send', async (job) => {
+    const { contactIds = [] } = job.payload || {};
+    let enqueued = 0;
+    for (const cid of contactIds) {
+      try {
+        // await: BullMQ's push is async — a rejected push must land in this
+        // catch, not escape as an unhandled rejection.
+        await jobQueue.push('email.send', { contactId: cid }, { maxRetries: 3 });
+        enqueued += 1;
+      } catch (e) {
+        log.warn('[email-jobs] failed to enqueue child:', e.message);
+      }
+    }
+    return { enqueued };
+  });
+
+  // ---- email.sync_status ----
+  // Mark any contact stuck in "pending" (never picked up) or "sending"
+  // (claimed, then the worker died mid-send) for >30 minutes as failed so
+  // the UI shows a clear error instead of an endless spinner.
+  jobQueue.register('email.sync_status', async () => {
+    const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const result = await exec(
+      `UPDATE contacts
+       SET status = 'failed', send_error = COALESCE(send_error, 'Timed out waiting for send')
+       WHERE status IN ('pending', 'sending') AND (last_send_attempt_at IS NULL OR last_send_attempt_at < ?)`,
+      [cutoff]
+    );
+    return { cleared: result.rowCount || 0 };
+  });
+}
+
+module.exports = { register };

@@ -1,0 +1,448 @@
+import React, { useState, useEffect, Suspense, lazy } from 'react';
+import { Routes, Route, NavLink, Navigate, Link, useLocation } from 'react-router-dom';
+import { useAuth } from './AuthContext';
+import { CampaignProvider, useCampaign } from './CampaignContext';
+import { ToastProvider } from './components/Toast';
+import { ConfirmProvider } from './components/ConfirmDialog';
+import { I18nProvider, useI18n } from './i18n';
+import { WorkspaceProvider } from './WorkspaceContext';
+import LanguageSwitcher from './components/LanguageSwitcher';
+import WorkspaceSwitcher from './components/WorkspaceSwitcher';
+import AuthPage from './pages/AuthPage';
+import CampaignList from './pages/CampaignList';
+import CampaignDetail from './pages/CampaignDetail';
+import ContactModule from './pages/ContactModule';
+import KolDatabase from './pages/KolDatabase';
+import MarketplacePage from './pages/MarketplacePage';
+import PipelinePage from './pages/PipelinePage';
+import UsersPage from './pages/UsersPage';
+import AgentsPage from './pages/AgentsPage';
+import ContentStudio from './pages/ContentStudio';
+import ConductorPage from './pages/ConductorPage';
+import ConnectionsPage from './pages/ConnectionsPage';
+import CalendarPage from './pages/CalendarPage';
+import AnalyticsPage from './pages/AnalyticsPage';
+import CommunityInboxPage from './pages/CommunityInboxPage';
+import AdsPage from './pages/AdsPage';
+import TranslatePage from './pages/TranslatePage';
+import LandingPage from './pages/LandingPage';
+import AcceptInvitePage from './pages/AcceptInvitePage';
+import SignupWithCodePage from './pages/SignupWithCodePage';
+import ForgotPasswordPage from './pages/ForgotPasswordPage';
+import ResetPasswordPage from './pages/ResetPasswordPage';
+import InviteCodesPage from './pages/InviteCodesPage';
+import ApifyRunsPage from './pages/ApifyRunsPage';
+import DiscoveryPage from './pages/DiscoveryPage';
+import ReviewsPage from './pages/ReviewsPage';
+import ChangelogPage from './pages/ChangelogPage';
+import WorkspaceSettingsPage from './pages/WorkspaceSettingsPage';
+import NotFoundPage from './components/NotFoundPage';
+import ErrorBoundary from './components/ErrorBoundary';
+import CommandPalette from './components/CommandPalette';
+import OnboardingTour from './components/OnboardingTour';
+
+// Lazy-load heavy pages
+const RoiDashboard = lazy(() => import('./pages/RoiDashboard'));
+
+function PageFallback() {
+  const { t } = useI18n();
+  return <div className="page-container"><div className="empty-state"><p>{t('common.loading')}</p></div></div>;
+}
+
+function useNavItems(user) {
+  const { t } = useI18n();
+  const isAdmin = user?.role === 'admin';
+  const items = [
+    { path: '/conductor', label: t('nav.conductor'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> },
+    { path: '/studio', label: t('nav.studio'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/></svg> },
+    { path: '/calendar', label: t('nav.calendar'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg> },
+    { path: '/connections', label: t('nav.connections'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> },
+    { path: '/analytics', label: t('nav.analytics'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg> },
+    { path: '/inbox', label: t('nav.community'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg> },
+    { path: '/ads', label: t('nav.ads'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 11l18-5v13L3 14v-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/></svg> },
+    { path: '/translate', label: t('nav.translate'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 8h10"/><path d="M9 4v4"/><path d="M7 12c0 4 3 7 7 7"/><path d="M17 20l4-9 4 9"/><path d="M18 17h6"/></svg> },
+    { path: '/agents', label: t('nav.agents'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> },
+    { path: '/pipeline', label: t('nav.pipeline'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> },
+    { path: '/campaigns', label: t('nav.campaigns'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg> },
+    { path: '/roi', label: t('nav.roi'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-5"/></svg> },
+    { path: '/contacts', label: t('nav.contacts'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg> },
+    { path: '/kol-database', label: t('nav.kol_database'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg> },
+    { path: '/marketplace', label: t('nav.marketplace'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 9l1.5-5h15L21 9"/><path d="M3 9h18v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9z"/><path d="M9 13h6"/></svg> },
+    { path: '/discovery', label: t('nav.discovery'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg> },
+    { path: '/reviews', label: t('nav.reviews'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg> },
+    { path: '/users', label: t('nav.users'), icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="8" r="4"/><path d="M20 21v-2a7 7 0 0 0-14 0v2"/></svg> },
+  ];
+  if (isAdmin) {
+    items.push({
+      path: '/invite-codes',
+      label: t('nav.invite_codes'),
+      icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>,
+    });
+    items.push({
+      path: '/apify-runs',
+      label: t('nav.apify_runs'),
+      icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 3v5h5"/><path d="M21 12a9 9 0 0 0-15.7-6.3L3 8"/><path d="M21 21v-5h-5"/><path d="M3 12a9 9 0 0 0 15.7 6.3L21 16"/></svg>,
+    });
+  }
+  return items;
+}
+
+function AppContent() {
+  const { user, loading, logout } = useAuth();
+  const [showUserMenu, setShowUserMenu] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [hasUnreadChangelog, setHasUnreadChangelog] = useState(false);
+  const { t } = useI18n();
+  const navItems = useNavItems(user);
+
+  // Check changelog on mount + when route changes to /changelog so the badge
+  // updates immediately after the user views it. Compares the latest
+  // entry's date to localStorage.
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    fetch('/api/changelog')
+      .then(r => r.ok ? r.json() : { entries: [] })
+      .then(d => {
+        if (cancelled) return;
+        const top = d.entries?.[0]?.date;
+        if (!top) { setHasUnreadChangelog(false); return; }
+        const seen = localStorage.getItem('influencex_changelog_last_seen_v1');
+        setHasUnreadChangelog(seen !== top);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [user, window.location.hash]);
+
+  if (loading) {
+    return (
+      <div className="auth-page">
+        <div className="auth-container">
+          <div className="auth-header">
+            <div className="auth-logo"><span className="auth-logo-icon">🎯</span><h1>Zirui</h1></div>
+            <p className="auth-subtitle" style={{ marginTop: '24px' }}>{t('common.loading')}</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // /accept-invite and /signup work regardless of auth state. /signup is
+  // the public invite-code signup; /accept-invite is the per-email invitation
+  // flow. If the user is already logged in with a different email, both flows
+  // return EMAIL_EXISTS and nudge them to log in instead.
+  if (window.location.hash.startsWith('#/accept-invite')) {
+    return (
+      <Routes>
+        <Route path="/accept-invite" element={<AcceptInvitePage />} />
+        <Route path="*" element={<AcceptInvitePage />} />
+      </Routes>
+    );
+  }
+  if (window.location.hash.startsWith('#/signup')) {
+    return (
+      <Routes>
+        <Route path="/signup" element={<SignupWithCodePage />} />
+        <Route path="*" element={<SignupWithCodePage />} />
+      </Routes>
+    );
+  }
+  // Forgot + reset password are reachable regardless of session — we don't
+  // want to hijack the reset link if the user happens to be logged into
+  // another account in the same browser.
+  if (window.location.hash.startsWith('#/forgot-password')) {
+    return (
+      <Routes>
+        <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+        <Route path="*" element={<ForgotPasswordPage />} />
+      </Routes>
+    );
+  }
+  if (window.location.hash.startsWith('#/reset-password')) {
+    return (
+      <Routes>
+        <Route path="/reset-password" element={<ResetPasswordPage />} />
+        <Route path="*" element={<ResetPasswordPage />} />
+      </Routes>
+    );
+  }
+
+  if (!user) {
+    // Public routes. /signup uses the invite-code flow (anyone with a valid
+    // code can register). /accept-invite renders the per-email invitation
+    // flow (creates account + logs in).
+    return (
+      <Routes>
+        <Route path="/" element={<LandingPage />} />
+        <Route path="/login" element={<AuthPage />} />
+        <Route path="/signup" element={<SignupWithCodePage />} />
+        <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+        <Route path="/reset-password" element={<ResetPasswordPage />} />
+        <Route path="/auth" element={<AuthPage />} />
+        <Route path="/accept-invite" element={<AcceptInvitePage />} />
+        <Route path="*" element={<AuthPage />} />
+      </Routes>
+    );
+  }
+
+  return (
+    <CampaignProvider>
+      <CommandPalette />
+      <OnboardingTour />
+      <div className="app-layout">
+        <div
+          className={`sidebar-backdrop ${mobileNavOpen ? 'visible' : ''}`}
+          onClick={() => setMobileNavOpen(false)}
+          aria-hidden="true"
+        />
+        <aside className={`sidebar ${mobileNavOpen ? 'open' : ''}`}>
+          <div className="sidebar-header">
+            <div className="sidebar-logo">
+              <span>🎯</span>
+              <h1>Zirui</h1>
+            </div>
+          </div>
+          <WorkspaceSwitcher />
+          <nav className="sidebar-nav">
+            {navItems.map(item => (
+              <NavLink
+                key={item.path}
+                to={item.path}
+                aria-label={item.label}
+                title={item.label}
+                onClick={() => setMobileNavOpen(false)}
+                className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
+              >
+                {item.icon}
+                <span>{item.label}</span>
+              </NavLink>
+            ))}
+          </nav>
+          <div className="sidebar-user">
+            <button
+              type="button"
+              className="sidebar-user-info"
+              onClick={() => setShowUserMenu(v => !v)}
+              aria-expanded={showUserMenu}
+              aria-haspopup="menu"
+              aria-label={t('nav.user_menu')}
+              style={{ width: '100%', background: 'none', border: 0, font: 'inherit', color: 'inherit', textAlign: 'left' }}
+            >
+              <div className="sidebar-avatar">
+                <img src={user.avatar_url || `https://api.dicebear.com/7.x/initials/svg?seed=${user.name}`} alt="" />
+              </div>
+              <div className="sidebar-user-details">
+                <div className="sidebar-user-name">{user.name}</div>
+                <div className="sidebar-user-email">{user.email}</div>
+              </div>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16" style={{ flexShrink: 0, opacity: 0.5 }}>
+                <polyline points="6 9 12 15 18 9"/>
+              </svg>
+            </button>
+            {showUserMenu && (
+              <div className="sidebar-user-menu" role="menu">
+                <div className="sidebar-user-menu-item" style={{ opacity: 0.5, cursor: 'default' }}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                  <span>{t(`roles.${user.role || 'member'}`)}</span>
+                </div>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="sidebar-user-menu-item"
+                  style={menuItemButtonStyle}
+                  onClick={() => { setShowUserMenu(false); localStorage.removeItem('influencex_onboarding_done_v1'); window.dispatchEvent(new Event('onboarding:restart')); }}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                  <span>{t('onboarding.restart_menu')}</span>
+                </button>
+                <NavLink
+                  to="/changelog"
+                  role="menuitem"
+                  className="sidebar-user-menu-item"
+                  onClick={() => { setShowUserMenu(false); setHasUnreadChangelog(false); }}
+                  style={{ textDecoration: 'none' }}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                  <span style={{ flex: 1 }}>{t('changelog.menu_item')}</span>
+                  {hasUnreadChangelog && (
+                    <span className="badge badge-green" style={{ fontSize: 9, padding: '1px 5px' }}>
+                      {t('changelog.new_badge')}
+                    </span>
+                  )}
+                </NavLink>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="sidebar-user-menu-item"
+                  style={menuItemButtonStyle}
+                  onClick={() => { setShowUserMenu(false); logout(); }}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+                  <span>{t('auth.sign_out')}</span>
+                </button>
+              </div>
+            )}
+          </div>
+        </aside>
+        <div className="main-wrapper">
+          <GlobalHeader onToggleMobileNav={() => setMobileNavOpen(o => !o)} />
+          <main className="main-content" onClick={() => { if (showUserMenu) setShowUserMenu(false); if (mobileNavOpen) setMobileNavOpen(false); }}>
+            {/* Per-route boundary: a render crash inside one page is contained
+                to the content area, leaving the sidebar + header usable so the
+                user can navigate away. Keyed on the route so navigating after
+                a crash remounts a fresh (non-errored) boundary. */}
+            <RouteBoundary>
+            <Routes>
+              <Route path="/" element={<HomeRedirect />} />
+              <Route path="/login" element={<Navigate to="/" replace />} />
+              <Route path="/auth" element={<Navigate to="/" replace />} />
+              {/* Signup / invite links opened while already signed in used to
+                  fall through to the 404. Show a friendly notice instead. */}
+              <Route path="/signup" element={<AlreadySignedIn />} />
+              <Route path="/accept-invite" element={<AlreadySignedIn showInviteHint />} />
+              <Route path="/conductor" element={<ConductorPage />} />
+              <Route path="/connections" element={<ConnectionsPage />} />
+              <Route path="/calendar" element={<CalendarPage />} />
+              <Route path="/analytics" element={<AnalyticsPage />} />
+              <Route path="/inbox" element={<CommunityInboxPage />} />
+              <Route path="/ads" element={<AdsPage />} />
+              <Route path="/translate" element={<TranslatePage />} />
+              <Route path="/studio" element={<ContentStudio />} />
+              <Route path="/agents" element={<AgentsPage />} />
+              <Route path="/pipeline" element={<PipelinePage />} />
+              <Route path="/campaigns" element={<CampaignList />} />
+              <Route path="/campaigns/:id" element={<CampaignDetail />} />
+              <Route path="/roi" element={<Suspense fallback={<PageFallback />}><RoiDashboard /></Suspense>} />
+              <Route path="/contacts" element={<ContactModule />} />
+              <Route path="/kol-database" element={<KolDatabase />} />
+              <Route path="/marketplace" element={<MarketplacePage />} />
+              <Route path="/discovery" element={<DiscoveryPage />} />
+              <Route path="/reviews" element={<ReviewsPage />} />
+              <Route path="/changelog" element={<ChangelogPage />} />
+              <Route path="/users" element={<UsersPage />} />
+              <Route path="/invite-codes" element={<InviteCodesPage />} />
+              <Route path="/apify-runs" element={<ApifyRunsPage />} />
+              <Route path="/workspace/settings" element={<WorkspaceSettingsPage />} />
+              <Route path="*" element={<NotFoundPage />} />
+            </Routes>
+            </RouteBoundary>
+          </main>
+        </div>
+      </div>
+    </CampaignProvider>
+  );
+}
+
+// Shown when a logged-in user opens /signup or /accept-invite (e.g. an admin
+// clicking the invite link they just generated). Those flows are meant for
+// logged-out visitors; instead of a 404, explain and point home.
+function AlreadySignedIn({ showInviteHint = false }) {
+  const { user } = useAuth();
+  const { t } = useI18n();
+  return (
+    <div className="page-container fade-in">
+      <div className="card" style={{ maxWidth: 520, margin: '48px auto', textAlign: 'center' }}>
+        <h3 style={{ marginBottom: 10 }}>{t('already_signed_in.title')}</h3>
+        <p style={{ fontSize: 14, color: 'var(--text-secondary)', marginBottom: showInviteHint ? 8 : 20 }}>
+          {t('already_signed_in.body', { email: user?.email || '' })}
+        </p>
+        {showInviteHint && (
+          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 20, lineHeight: 1.5 }}>
+            {t('already_signed_in.accept_invite_hint')}
+          </p>
+        )}
+        <Link to="/" className="btn btn-primary" style={{ textDecoration: 'none' }}>
+          {t('already_signed_in.go_home')}
+        </Link>
+      </div>
+    </div>
+  );
+}
+
+// Smart landing: first-time users with zero campaigns get sent to Conductor
+// (the best place to bootstrap a plan from scratch). Returning users with
+// at least one campaign land on Pipeline (their main daily workspace).
+function HomeRedirect() {
+  const { campaigns, loading } = useCampaign();
+  if (loading) return null;
+  return <Navigate to={campaigns.length > 0 ? '/pipeline' : '/conductor'} replace />;
+}
+
+function GlobalHeader({ onToggleMobileNav }) {
+  const { campaigns, selectedCampaignId, selectedCampaign, selectCampaign } = useCampaign();
+  const { t } = useI18n();
+
+  return (
+    <div className="global-header">
+      <div className="global-header-left">
+        <button
+          className="mobile-menu-btn"
+          onClick={onToggleMobileNav}
+          aria-label={t('nav.toggle_menu')}
+          title={t('nav.toggle_menu')}
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        </button>
+        <span className="global-header-label">{t('nav.campaigns')}:</span>
+        <select
+          className="global-campaign-select"
+          value={selectedCampaignId}
+          onChange={e => selectCampaign(e.target.value)}
+        >
+          {campaigns.length === 0 && <option value="">{t('campaigns.no_campaigns')}</option>}
+          {campaigns.map(c => (
+            <option key={c.id} value={c.id}>{c.name}</option>
+          ))}
+        </select>
+        {selectedCampaign && (
+          <div className="global-header-stats">
+            <span className="global-stat">
+              <span className={`badge ${selectedCampaign.status === 'active' ? 'badge-green' : 'badge-gray'}`}>{t(`campaigns.status_${selectedCampaign.status}`) || selectedCampaign.status}</span>
+            </span>
+            <span className="global-stat">{t('campaigns.kols_total', { count: selectedCampaign.kol_total || 0 })}</span>
+            <span className="global-stat">{t('campaigns.kols_approved', { count: selectedCampaign.kol_approved || 0 })}</span>
+            {selectedCampaign.budget > 0 && <span className="global-stat">{t('campaigns.budget_label', { amount: Number(selectedCampaign.budget).toLocaleString() })}</span>}
+          </div>
+        )}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <LanguageSwitcher />
+      </div>
+    </div>
+  );
+}
+
+function BoundaryWithI18n({ children }) {
+  const { t } = useI18n();
+  return <ErrorBoundary t={t}>{children}</ErrorBoundary>;
+}
+
+// Content-area boundary. `key` on the current path means a crashed page's
+// boundary is thrown away when the user navigates, instead of latching the
+// error UI forever.
+function RouteBoundary({ children }) {
+  const { t } = useI18n();
+  const location = useLocation();
+  return <ErrorBoundary key={location.pathname} t={t}>{children}</ErrorBoundary>;
+}
+
+const menuItemButtonStyle = {
+  width: '100%', background: 'none', border: 0, font: 'inherit',
+  textAlign: 'left', color: 'inherit',
+};
+
+export default function App() {
+  return (
+    <I18nProvider>
+      <ToastProvider>
+        <ConfirmProvider>
+          <WorkspaceProvider>
+            <BoundaryWithI18n>
+              <AppContent />
+            </BoundaryWithI18n>
+          </WorkspaceProvider>
+        </ConfirmProvider>
+      </ToastProvider>
+    </I18nProvider>
+  );
+}

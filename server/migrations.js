@@ -1,0 +1,1190 @@
+/**
+ * Simple forward-only migration framework.
+ *
+ * Migrations are versioned SQL transformations tracked in a `schema_migrations`
+ * table. Each migration has a unique string id (typically a timestamp + name)
+ * and an up() function that runs SQL. Down-migrations are not supported —
+ * this is intentional to keep ops simple for a small team.
+ *
+ * To add a migration: push a new entry to MIGRATIONS below. The server will
+ * auto-run pending migrations on startup.
+ */
+
+const { v4: uuidv4 } = require('uuid');
+
+// Tables that need a workspace_id column added in the multi-tenancy migration.
+// New tables created in v2 (agents, content_pieces, etc) declare workspace_id
+// in their CREATE TABLE directly; this list covers the 13 pre-existing tables.
+const MULTITENANT_TABLES = [
+  'campaigns', 'kols', 'contacts', 'pipeline_jobs', 'kol_database',
+  'content_data', 'registration_data', 'content_scrape_cache',
+  'content_daily_stats', 'dashboard_events', 'discovery_jobs',
+  'discovery_results', 'email_replies',
+];
+
+async function addWorkspaceIdColumn(exec, table) {
+  try {
+    await exec(`ALTER TABLE ${table} ADD COLUMN workspace_id TEXT`);
+  } catch (e) {
+    // Idempotent: column may already exist on re-run
+    if (!/duplicate|already exists/i.test(e.message)) throw e;
+  }
+}
+
+async function ensureWorkspaceIndex(exec, table) {
+  try {
+    await exec(`CREATE INDEX IF NOT EXISTS idx_${table}_workspace ON ${table}(workspace_id)`);
+  } catch (e) {
+    if (!/already exists/i.test(e.message)) throw e;
+  }
+}
+
+const MIGRATIONS = [
+  {
+    id: '2026-04-18-scheduler-fields',
+    description: 'Add scheduled_send_at and follow_up_count to contacts',
+    up: async ({ exec }) => {
+      for (const stmt of [
+        'ALTER TABLE contacts ADD COLUMN scheduled_send_at TIMESTAMP',
+        'ALTER TABLE contacts ADD COLUMN follow_up_count INTEGER DEFAULT 0',
+      ]) {
+        try { await exec(stmt); } catch (e) {
+          if (!/duplicate|already exists/i.test(e.message)) throw e;
+        }
+      }
+    },
+  },
+
+  {
+    id: '2026-04-19-prompts-schedules-oauth',
+    description: 'Prompt presets, scheduled publishes, platform OAuth connections',
+    up: async ({ exec }) => {
+      const stmts = [
+        `CREATE TABLE IF NOT EXISTS prompt_presets (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          description TEXT,
+          prompt TEXT NOT NULL,
+          type TEXT NOT NULL,
+          agent_id TEXT,
+          tags TEXT DEFAULT '[]',
+          use_count INTEGER DEFAULT 0,
+          created_by TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_prompt_presets_workspace ON prompt_presets(workspace_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_prompt_presets_type ON prompt_presets(type)`,
+
+        `CREATE TABLE IF NOT EXISTS scheduled_publishes (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          content_piece_id TEXT,
+          platforms TEXT NOT NULL,
+          content_snapshot TEXT NOT NULL,
+          scheduled_at TIMESTAMP NOT NULL,
+          status TEXT DEFAULT 'pending',
+          result TEXT,
+          mode TEXT DEFAULT 'intent',
+          attempts INTEGER DEFAULT 0,
+          created_by TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          last_attempt_at TIMESTAMP,
+          completed_at TIMESTAMP
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_sched_pub_workspace ON scheduled_publishes(workspace_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_sched_pub_due ON scheduled_publishes(status, scheduled_at)`,
+
+        `CREATE TABLE IF NOT EXISTS platform_connections (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          platform TEXT NOT NULL,
+          account_name TEXT,
+          account_id TEXT,
+          access_token TEXT,
+          refresh_token TEXT,
+          token_scope TEXT,
+          expires_at TIMESTAMP,
+          metadata TEXT DEFAULT '{}',
+          connected_by TEXT,
+          connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          last_used_at TIMESTAMP,
+          UNIQUE(workspace_id, platform)
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_platform_conn_workspace ON platform_connections(workspace_id)`,
+
+        `CREATE TABLE IF NOT EXISTS oauth_states (
+          state TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          platform TEXT NOT NULL,
+          code_verifier TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`,
+
+        `CREATE TABLE IF NOT EXISTS competitor_snapshots (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          competitor_name TEXT NOT NULL,
+          url TEXT NOT NULL,
+          title TEXT,
+          text_digest TEXT,
+          content_hash TEXT,
+          metadata TEXT DEFAULT '{}',
+          captured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_comp_snap_workspace ON competitor_snapshots(workspace_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_comp_snap_url ON competitor_snapshots(url)`,
+      ];
+      for (const s of stmts) {
+        try { await exec(s); } catch (e) {
+          if (!/already exists/i.test(e.message)) throw e;
+        }
+      }
+    },
+  },
+
+  {
+    id: '2026-04-19-sso-billing-blog',
+    description: 'Google SSO sub on users, subscriptions + plans for Stripe billing, blog-platform connection extensions',
+    up: async ({ exec }) => {
+      // Google SSO — add a nullable `google_sub` column so we can link
+      // an OAuth identity to an existing email-password user or bootstrap
+      // a new user without a password.
+      const isPostgres = /^postgres(ql)?:\/\//.test(process.env.DATABASE_URL || '');
+      const stmts = [
+        'ALTER TABLE users ADD COLUMN google_sub TEXT',
+        'ALTER TABLE users ADD COLUMN google_picture TEXT',
+      ];
+      // Postgres enforces NOT NULL; SQLite has no ALTER COLUMN syntax at all,
+      // and columns added later are nullable by default — so we only issue
+      // DROP NOT NULL on Postgres.
+      if (isPostgres) {
+        stmts.push('ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL');
+      }
+      for (const stmt of stmts) {
+        try { await exec(stmt); } catch (e) {
+          if (!/duplicate|already exists|does not exist|not null constraint/i.test(e.message)) throw e;
+        }
+      }
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)'); } catch {}
+
+      // Stripe billing — subscriptions scoped to workspace. A workspace has
+      // at most one active subscription; historical rows are kept for audit.
+      try {
+        await exec(`CREATE TABLE IF NOT EXISTS subscriptions (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          stripe_customer_id TEXT,
+          stripe_subscription_id TEXT,
+          stripe_price_id TEXT,
+          plan TEXT DEFAULT 'free',
+          status TEXT DEFAULT 'active',
+          current_period_end TIMESTAMP,
+          seats INTEGER DEFAULT 1,
+          metadata TEXT DEFAULT '{}',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+      } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_subscriptions_workspace ON subscriptions(workspace_id)'); } catch {}
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe_sub ON subscriptions(stripe_subscription_id)'); } catch {}
+    },
+  },
+
+  {
+    id: '2026-04-19-agent-runtime-tables',
+    description: 'Create agents, agent_runs, agent_traces, content_pieces, brand_voices tables for Phase A Week 2',
+    up: async ({ exec }) => {
+      // agents table: static metadata about registered agents. Populated
+      // when the server boots + each registered agent calls upsertAgent.
+      try {
+        await exec(`CREATE TABLE IF NOT EXISTS agents (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          description TEXT,
+          version TEXT,
+          capabilities TEXT DEFAULT '[]',
+          input_schema TEXT,
+          output_schema TEXT,
+          enabled INTEGER DEFAULT 1,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+      } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+
+      try {
+        await exec(`CREATE TABLE IF NOT EXISTS agent_runs (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT,
+          agent_id TEXT NOT NULL,
+          user_id TEXT,
+          input TEXT,
+          output TEXT,
+          status TEXT DEFAULT 'running',
+          error TEXT,
+          cost_usd_cents INTEGER DEFAULT 0,
+          input_tokens INTEGER DEFAULT 0,
+          output_tokens INTEGER DEFAULT 0,
+          duration_ms INTEGER,
+          started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          completed_at TIMESTAMP
+        )`);
+      } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+
+      try {
+        await exec(`CREATE TABLE IF NOT EXISTS agent_traces (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          data TEXT,
+          timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+      } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+
+      try {
+        await exec(`CREATE TABLE IF NOT EXISTS content_pieces (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          type TEXT,
+          title TEXT,
+          body TEXT,
+          metadata TEXT DEFAULT '{}',
+          status TEXT DEFAULT 'draft',
+          created_by_agent_run_id TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+      } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+
+      try {
+        await exec(`CREATE TABLE IF NOT EXISTS brand_voices (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          description TEXT,
+          style_guide TEXT,
+          tone_words TEXT DEFAULT '[]',
+          do_examples TEXT DEFAULT '[]',
+          dont_examples TEXT DEFAULT '[]',
+          is_default INTEGER DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+      } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+
+      try {
+        await exec(`CREATE TABLE IF NOT EXISTS conductor_plans (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          goal TEXT NOT NULL,
+          plan TEXT NOT NULL,
+          status TEXT DEFAULT 'pending_approval',
+          created_by TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          approved_at TIMESTAMP,
+          completed_at TIMESTAMP
+        )`);
+      } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+
+      // Indexes
+      for (const stmt of [
+        'CREATE INDEX IF NOT EXISTS idx_agent_runs_workspace ON agent_runs(workspace_id)',
+        'CREATE INDEX IF NOT EXISTS idx_agent_runs_agent ON agent_runs(agent_id)',
+        'CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status)',
+        'CREATE INDEX IF NOT EXISTS idx_agent_traces_run ON agent_traces(run_id)',
+        'CREATE INDEX IF NOT EXISTS idx_content_pieces_workspace ON content_pieces(workspace_id)',
+        'CREATE INDEX IF NOT EXISTS idx_brand_voices_workspace ON brand_voices(workspace_id)',
+        'CREATE INDEX IF NOT EXISTS idx_conductor_plans_workspace ON conductor_plans(workspace_id)',
+      ]) {
+        try { await exec(stmt); } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      }
+    },
+  },
+
+  {
+    id: '2026-04-18-multitenancy-init',
+    description: 'Add workspace_id to 13 business tables; backfill existing data into owner workspaces',
+    up: async ({ exec, query, queryOne }) => {
+      // 1. Add workspace_id column + index on each business table.
+      //    workspaces & workspace_members tables are created by the base schema
+      //    in database.js — no-op here.
+      for (const table of MULTITENANT_TABLES) {
+        await addWorkspaceIdColumn(exec, table);
+        await ensureWorkspaceIndex(exec, table);
+      }
+
+      // 2. Backfill: create one workspace per existing user.
+      //    Using workspace_members as the "has this user been migrated" marker
+      //    so this block is idempotent.
+      const usersResult = await query('SELECT id, name, email FROM users ORDER BY created_at ASC');
+      const users = usersResult.rows || [];
+      const userWorkspaces = new Map(); // user_id -> workspace_id
+
+      for (const u of users) {
+        const existing = await queryOne(
+          'SELECT workspace_id FROM workspace_members WHERE user_id = ?',
+          [u.id]
+        );
+        if (existing) {
+          userWorkspaces.set(u.id, existing.workspace_id);
+          continue;
+        }
+
+        const wsId = uuidv4();
+        const slug = slugify(u.name || u.email.split('@')[0], wsId);
+        const name = (u.name ? `${u.name}'s workspace` : u.email);
+
+        await exec(
+          'INSERT INTO workspaces (id, name, slug, owner_user_id, plan) VALUES (?, ?, ?, ?, ?)',
+          [wsId, name, slug, u.id, 'starter']
+        );
+        await exec(
+          'INSERT INTO workspace_members (workspace_id, user_id, role) VALUES (?, ?, ?)',
+          [wsId, u.id, 'admin']
+        );
+        userWorkspaces.set(u.id, wsId);
+      }
+
+      // 3. Lazily determine a target workspace for orphan data when we hit it.
+      //    Policy:
+      //      - 1 user: orphans go to that user's workspace (no Legacy sidecar)
+      //      - >1 users: create a shared "Legacy" workspace (only if needed)
+      //        owned by the first admin, with all users as members so none
+      //        lose access to their old data
+      //      - 0 users: skip (there's no owner; rows stay orphaned)
+      let cachedFallbackWsId = null;
+      async function resolveFallbackWorkspace() {
+        if (cachedFallbackWsId !== null) return cachedFallbackWsId;
+        if (users.length === 0) {
+          cachedFallbackWsId = false; // sentinel: no fallback possible
+          return null;
+        }
+        if (users.length === 1) {
+          cachedFallbackWsId = userWorkspaces.get(users[0].id);
+          return cachedFallbackWsId;
+        }
+        // >1 users: find or create Legacy workspace
+        const existing = await queryOne("SELECT id FROM workspaces WHERE slug = 'legacy'");
+        if (existing) {
+          cachedFallbackWsId = existing.id;
+          return cachedFallbackWsId;
+        }
+        const firstAdmin = users.find(u => u.role === 'admin') || users[0];
+        const newId = uuidv4();
+        await exec(
+          'INSERT INTO workspaces (id, name, slug, owner_user_id, plan) VALUES (?, ?, ?, ?, ?)',
+          [newId, 'Legacy data', 'legacy', firstAdmin.id, 'starter']
+        );
+        for (const u of users) {
+          await exec(
+            'INSERT INTO workspace_members (workspace_id, user_id, role) VALUES (?, ?, ?)',
+            [newId, u.id, u.id === firstAdmin.id ? 'admin' : 'editor']
+          );
+        }
+        cachedFallbackWsId = newId;
+        return newId;
+      }
+
+      for (const table of MULTITENANT_TABLES) {
+        const orphan = await queryOne(
+          `SELECT COUNT(*) as c FROM ${table} WHERE workspace_id IS NULL`
+        );
+        const count = parseInt(orphan?.c || 0);
+        if (count === 0) continue;
+
+        // For tables that reference campaigns, inherit workspace_id from
+        // the parent campaign if available (keeps things tidy).
+        const hasCampaignFk = ['kols', 'contacts', 'pipeline_jobs'].includes(table);
+        if (hasCampaignFk) {
+          await exec(
+            `UPDATE ${table} SET workspace_id = (
+              SELECT workspace_id FROM campaigns WHERE campaigns.id = ${table}.campaign_id
+            ) WHERE workspace_id IS NULL AND campaign_id IS NOT NULL`
+          );
+        }
+
+        // Anything still orphaned goes to the fallback workspace (user's own
+        // for single-user installs, or Legacy for multi-user installs).
+        const stillOrphan = await queryOne(
+          `SELECT COUNT(*) as c FROM ${table} WHERE workspace_id IS NULL`
+        );
+        if (parseInt(stillOrphan?.c || 0) > 0) {
+          const wsId = await resolveFallbackWorkspace();
+          if (wsId) {
+            await exec(`UPDATE ${table} SET workspace_id = ? WHERE workspace_id IS NULL`, [wsId]);
+          }
+        }
+      }
+
+      // 4. Summary (for logs)
+      const totalWs = await queryOne('SELECT COUNT(*) as c FROM workspaces');
+      console.log(`[migration] multitenancy-init complete: ${totalWs?.c || 0} workspaces total`);
+    },
+  },
+
+  {
+    id: '2026-04-22-inbox-messages',
+    description: 'Community Agent inbox_messages table — unified mentions / comments / DMs across platforms',
+    up: async ({ exec }) => {
+      // One table for all inbound community touchpoints. Platform-specific
+      // columns (thread_id, parent_id) are nullable because not every
+      // platform exposes them. `raw` stores the original payload for
+      // future fields we haven't surfaced yet.
+      try {
+        await exec(`CREATE TABLE IF NOT EXISTS inbox_messages (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          platform TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          external_id TEXT,
+          thread_id TEXT,
+          parent_id TEXT,
+          author_handle TEXT,
+          author_name TEXT,
+          author_avatar_url TEXT,
+          text TEXT,
+          url TEXT,
+          sentiment TEXT,
+          priority TEXT DEFAULT 'normal',
+          status TEXT DEFAULT 'open',
+          assignee_user_id TEXT,
+          draft_reply TEXT,
+          replied_at TIMESTAMP,
+          occurred_at TIMESTAMP,
+          fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          raw TEXT,
+          tags TEXT DEFAULT '[]'
+        )`);
+      } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      // Uniqueness per (workspace, platform, external_id) prevents dup-pulls.
+      try { await exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_messages_ext ON inbox_messages(workspace_id, platform, external_id)'); } catch {}
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_inbox_messages_ws_status ON inbox_messages(workspace_id, status)'); } catch {}
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_inbox_messages_occurred ON inbox_messages(workspace_id, occurred_at DESC)'); } catch {}
+    },
+  },
+
+  {
+    id: '2026-04-22-brand-voice-embeddings',
+    description: 'pgvector extension + embedding column on brand_voices (Postgres only; SQLite stores JSON floats fallback)',
+    up: async ({ exec }) => {
+      const isPostgres = /^postgres(ql)?:\/\//.test(process.env.DATABASE_URL || '');
+      if (isPostgres) {
+        // pgvector is available on Cloud SQL PG15 as a shared_preload extension.
+        // CREATE EXTENSION requires superuser-ish perms; on Cloud SQL the
+        // `cloudsqlsuperuser` role can run it. If the caller lacks perms we
+        // swallow and fall through — the column add below will fail loudly and
+        // the operator can enable the extension manually.
+        try { await exec('CREATE EXTENSION IF NOT EXISTS vector'); } catch (e) {
+          console.warn('[migration] could not CREATE EXTENSION vector — run it as a superuser:', e.message);
+        }
+        try { await exec('ALTER TABLE brand_voices ADD COLUMN embedding vector(1536)'); } catch (e) {
+          if (!/already exists|duplicate column/i.test(e.message)) throw e;
+        }
+        // IVFFlat index for cosine similarity. Tuning: lists ≈ sqrt(rows); we
+        // start with 100, expecting ≤10K brand_voices per installation.
+        try {
+          await exec(
+            'CREATE INDEX IF NOT EXISTS idx_brand_voices_embedding ON brand_voices USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)'
+          );
+        } catch (e) {
+          // IVFFlat needs rows to build; ignore if table is empty or index driver chokes.
+          if (!/already exists|empty/i.test(e.message)) console.warn('[migration] ivfflat index skipped:', e.message);
+        }
+      } else {
+        // SQLite fallback: store embedding as JSON text; similarity is computed
+        // in-process. Keeps the migration idempotent across drivers — the
+        // column name `embedding` is the same so application code is portable.
+        try { await exec('ALTER TABLE brand_voices ADD COLUMN embedding TEXT'); } catch (e) {
+          if (!/duplicate column/i.test(e.message)) throw e;
+        }
+      }
+      // Dimension + model columns let us migrate to a different embedding
+      // model later without orphaning existing rows.
+      try { await exec('ALTER TABLE brand_voices ADD COLUMN embedding_model TEXT'); } catch (e) {
+        if (!/already exists|duplicate column/i.test(e.message)) throw e;
+      }
+      try { await exec('ALTER TABLE brand_voices ADD COLUMN embedding_dims INTEGER'); } catch (e) {
+        if (!/already exists|duplicate column/i.test(e.message)) throw e;
+      }
+    },
+  },
+
+  {
+    id: '2026-04-23-outreach-email-upgrade',
+    description: 'Outreach email upgrade: contacts tracking columns, email_templates, mailbox_accounts, email_events',
+    up: async ({ exec }) => {
+      // 1. Extend contacts with tracking fields
+      const contactCols = [
+        'ALTER TABLE contacts ADD COLUMN delivered_at TIMESTAMP',
+        'ALTER TABLE contacts ADD COLUMN first_opened_at TIMESTAMP',
+        'ALTER TABLE contacts ADD COLUMN last_opened_at TIMESTAMP',
+        'ALTER TABLE contacts ADD COLUMN bounce_reason TEXT',
+        'ALTER TABLE contacts ADD COLUMN send_error TEXT',
+        'ALTER TABLE contacts ADD COLUMN send_attempts INTEGER DEFAULT 0',
+        'ALTER TABLE contacts ADD COLUMN last_send_attempt_at TIMESTAMP',
+        'ALTER TABLE contacts ADD COLUMN mailbox_account_id TEXT',
+        'ALTER TABLE contacts ADD COLUMN provider_message_id TEXT',
+      ];
+      for (const stmt of contactCols) {
+        try { await exec(stmt); } catch (e) {
+          if (!/already exists|duplicate column/i.test(e.message)) throw e;
+        }
+      }
+
+      // 2. Custom email templates (built-in defaults stay in code)
+      try {
+        await exec(`CREATE TABLE IF NOT EXISTS email_templates (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          language TEXT DEFAULT 'en',
+          cooperation_type TEXT,
+          subject TEXT NOT NULL,
+          body TEXT NOT NULL,
+          variables TEXT DEFAULT '[]',
+          is_default INTEGER DEFAULT 0,
+          created_by TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+      } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_email_templates_workspace ON email_templates(workspace_id)'); } catch {}
+
+      // 3. Per-workspace mailbox accounts (Resend / SMTP / future OAuth).
+      // credentials_encrypted holds JSON blob {api_key?, smtp_host?, ...}.
+      // For a first cut we store as-is; a later migration can wrap with
+      // libsodium sealed boxes once we have a workspace-scoped key.
+      try {
+        await exec(`CREATE TABLE IF NOT EXISTS mailbox_accounts (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          from_email TEXT NOT NULL,
+          from_name TEXT,
+          reply_to TEXT,
+          signature_html TEXT,
+          credentials_encrypted TEXT,
+          status TEXT DEFAULT 'active',
+          is_default INTEGER DEFAULT 0,
+          last_verified_at TIMESTAMP,
+          last_error TEXT,
+          created_by TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+      } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_mailbox_accounts_workspace ON mailbox_accounts(workspace_id)'); } catch {}
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_mailbox_accounts_default ON mailbox_accounts(workspace_id, is_default)'); } catch {}
+
+      // 4. Email delivery/open/bounce events (Resend webhook feed)
+      try {
+        await exec(`CREATE TABLE IF NOT EXISTS email_events (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT,
+          contact_id TEXT,
+          provider_message_id TEXT,
+          event_type TEXT NOT NULL,
+          payload TEXT,
+          occurred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+      } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_email_events_contact ON email_events(contact_id)'); } catch {}
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_email_events_msgid ON email_events(provider_message_id)'); } catch {}
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_email_events_workspace ON email_events(workspace_id)'); } catch {}
+    },
+  },
+
+  {
+    id: '2026-04-23-kol-email-blocked',
+    description: 'Hard-bounce auto-disable: kols.email_blocked_at / email_blocked_reason',
+    up: async ({ exec }) => {
+      for (const stmt of [
+        'ALTER TABLE kols ADD COLUMN email_blocked_at TIMESTAMP',
+        'ALTER TABLE kols ADD COLUMN email_blocked_reason TEXT',
+      ]) {
+        try { await exec(stmt); }
+        catch (e) { if (!/already exists|duplicate column/i.test(e.message)) throw e; }
+      }
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_kols_email_blocked ON kols(email_blocked_at)'); } catch {}
+    },
+  },
+
+  {
+    id: '2026-04-23-ab-winner',
+    description: 'A/B auto-winner: email_templates.winner_variant_id',
+    up: async ({ exec }) => {
+      try { await exec('ALTER TABLE email_templates ADD COLUMN winner_variant_id TEXT'); }
+      catch (e) { if (!/already exists|duplicate column/i.test(e.message)) throw e; }
+    },
+  },
+
+  {
+    id: '2026-04-23-ab-template-variants',
+    description: 'A/B template variants: email_templates.variant_of/variant_label + contacts.template_id/variant_id',
+    up: async ({ exec }) => {
+      // Parent template has variant_of = NULL; children reference their parent.
+      // variant_label is a short tag like "A", "B", or "shorter-subject".
+      for (const stmt of [
+        'ALTER TABLE email_templates ADD COLUMN variant_of TEXT',
+        'ALTER TABLE email_templates ADD COLUMN variant_label TEXT',
+        'ALTER TABLE contacts ADD COLUMN template_id TEXT',
+        'ALTER TABLE contacts ADD COLUMN variant_id TEXT',
+      ]) {
+        try { await exec(stmt); } catch (e) {
+          if (!/already exists|duplicate column/i.test(e.message)) throw e;
+        }
+      }
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_email_templates_variant_of ON email_templates(variant_of)'); } catch {}
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_contacts_template_id ON contacts(template_id)'); } catch {}
+      try { await exec('CREATE INDEX IF NOT EXISTS idx_contacts_variant_id ON contacts(variant_id)'); } catch {}
+    },
+  },
+
+  {
+    id: '2026-04-23-sched-publish-retry',
+    description: 'next_retry_at + max_attempts + error_message on scheduled_publishes for retry-with-backoff',
+    up: async ({ exec }) => {
+      // Backoff window persisted per-row so we survive server restarts.
+      // A row stays 'pending' across retries and only flips to 'error' when
+      // attempts ≥ max_attempts. The due-query treats next_retry_at as the
+      // effective scheduled_at (coalesce in scheduled-publish.js).
+      for (const stmt of [
+        'ALTER TABLE scheduled_publishes ADD COLUMN next_retry_at TIMESTAMP',
+        'ALTER TABLE scheduled_publishes ADD COLUMN max_attempts INTEGER DEFAULT 3',
+        'ALTER TABLE scheduled_publishes ADD COLUMN error_message TEXT',
+      ]) {
+        try { await exec(stmt); } catch (e) {
+          if (!/already exists|duplicate column/i.test(e.message)) throw e;
+        }
+      }
+      try {
+        await exec('CREATE INDEX IF NOT EXISTS idx_sched_pub_retry ON scheduled_publishes(status, next_retry_at)');
+      } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+    },
+  },
+
+  {
+    id: '2026-04-25-template-auto-promote-winner',
+    description: 'Per-template flag: auto-promote the winning variant once a/b is statistically significant',
+    up: async ({ exec }) => {
+      try {
+        await exec('ALTER TABLE email_templates ADD COLUMN auto_promote_winner INTEGER DEFAULT 0');
+      } catch (e) {
+        if (!/duplicate|already exists/i.test(e.message)) throw e;
+      }
+    },
+  },
+
+  {
+    id: '2026-04-25-discovery-error-message',
+    description: 'Persist discovery job failure reason so the UI can show why a run failed',
+    up: async ({ exec }) => {
+      try {
+        await exec('ALTER TABLE discovery_jobs ADD COLUMN error_message TEXT');
+      } catch (e) {
+        if (!/duplicate|already exists/i.test(e.message)) throw e;
+      }
+    },
+  },
+
+  {
+    id: '2026-04-25-invitations',
+    description: 'Invitations table for invite-only signup (public /api/auth/register is removed)',
+    up: async ({ exec }) => {
+      // Admin invites an email → we store a random token here, share the
+      // link with the invitee, they POST /api/invitations/:token/accept
+      // with name+password to create their user + workspace membership in
+      // one step. One invitation is single-use; accepted_at stamps it.
+      await exec(`
+        CREATE TABLE IF NOT EXISTS invitations (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          email TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'editor',
+          token TEXT NOT NULL UNIQUE,
+          invited_by TEXT NOT NULL,
+          expires_at TIMESTAMP NOT NULL,
+          accepted_at TIMESTAMP,
+          accepted_user_id TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      for (const stmt of [
+        'CREATE INDEX IF NOT EXISTS idx_invitations_token ON invitations(token)',
+        'CREATE INDEX IF NOT EXISTS idx_invitations_workspace ON invitations(workspace_id)',
+        'CREATE INDEX IF NOT EXISTS idx_invitations_email ON invitations(email)',
+      ]) {
+        try { await exec(stmt); } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      }
+    },
+  },
+
+  {
+    id: '2026-04-27-invite-codes',
+    description: 'Generic invite codes for public signup. Admin generates a code; anyone with the code can register (multi-use, optional expiry).',
+    up: async ({ exec }) => {
+      // Distinct from the per-email `invitations` table: invite_codes are
+      // generic, sharable codes (e.g. "INFLX-7K3M9X") that don't bind to a
+      // specific email. Admin creates the code and chooses target workspace +
+      // default role. Each registration consumes one "use"; code is exhausted
+      // when used_count >= max_uses, or revoked_at is set.
+      await exec(`
+        CREATE TABLE IF NOT EXISTS invite_codes (
+          id TEXT PRIMARY KEY,
+          code TEXT NOT NULL UNIQUE,
+          workspace_id TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'editor',
+          max_uses INTEGER NOT NULL DEFAULT 1,
+          used_count INTEGER NOT NULL DEFAULT 0,
+          expires_at TIMESTAMP,
+          revoked_at TIMESTAMP,
+          note TEXT,
+          created_by TEXT NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      for (const stmt of [
+        'CREATE INDEX IF NOT EXISTS idx_invite_codes_code ON invite_codes(code)',
+        'CREATE INDEX IF NOT EXISTS idx_invite_codes_workspace ON invite_codes(workspace_id)',
+        'CREATE INDEX IF NOT EXISTS idx_invite_codes_created_by ON invite_codes(created_by)',
+      ]) {
+        try { await exec(stmt); } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      }
+    },
+  },
+
+  {
+    id: '2026-04-27-invite-code-redemptions',
+    description: 'Audit trail of who used which invite code',
+    up: async ({ exec }) => {
+      await exec(`
+        CREATE TABLE IF NOT EXISTS invite_code_redemptions (
+          id TEXT PRIMARY KEY,
+          invite_code_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          email TEXT NOT NULL,
+          redeemed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      for (const stmt of [
+        'CREATE INDEX IF NOT EXISTS idx_invite_redemptions_code ON invite_code_redemptions(invite_code_id)',
+        'CREATE INDEX IF NOT EXISTS idx_invite_redemptions_user ON invite_code_redemptions(user_id)',
+      ]) {
+        try { await exec(stmt); } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      }
+    },
+  },
+
+  {
+    id: '2026-04-27-apify-runs',
+    description: 'Persist every Apify actor invocation: status, cost, duration, error. Lets ops debug stuck runs and enforce per-workspace budgets.',
+    up: async ({ exec }) => {
+      // run_id = Apify's run identifier when sync mode returns it (or a local
+      // uuid for inline runs). status: pending|running|succeeded|failed|timeout.
+      // cost_usd is best-effort; Apify returns it on completion for paid actors.
+      // payload + result_summary stored as TEXT JSON; SQLite has no JSONB.
+      await exec(`
+        CREATE TABLE IF NOT EXISTS apify_runs (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT,
+          actor_id TEXT NOT NULL,
+          run_id TEXT,
+          status TEXT NOT NULL DEFAULT 'pending',
+          cost_usd REAL DEFAULT 0,
+          duration_ms INTEGER,
+          input_payload TEXT,
+          result_summary TEXT,
+          error_message TEXT,
+          started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          finished_at TIMESTAMP
+        )
+      `);
+      for (const stmt of [
+        'CREATE INDEX IF NOT EXISTS idx_apify_runs_workspace ON apify_runs(workspace_id)',
+        'CREATE INDEX IF NOT EXISTS idx_apify_runs_status ON apify_runs(status)',
+        'CREATE INDEX IF NOT EXISTS idx_apify_runs_actor ON apify_runs(actor_id)',
+        'CREATE INDEX IF NOT EXISTS idx_apify_runs_started ON apify_runs(started_at)',
+      ]) {
+        try { await exec(stmt); } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      }
+    },
+  },
+
+  {
+    id: '2026-04-27-password-reset',
+    description: 'Password reset tokens. One-time, expires in 1 hour. Stored hashed (sha256) so a DB leak does not let an attacker reset accounts.',
+    up: async ({ exec }) => {
+      await exec(`
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          token_hash TEXT NOT NULL UNIQUE,
+          expires_at TIMESTAMP NOT NULL,
+          used_at TIMESTAMP,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      for (const stmt of [
+        'CREATE INDEX IF NOT EXISTS idx_password_reset_user ON password_reset_tokens(user_id)',
+        'CREATE INDEX IF NOT EXISTS idx_password_reset_hash ON password_reset_tokens(token_hash)',
+      ]) {
+        try { await exec(stmt); } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      }
+    },
+  },
+
+  {
+    id: '2026-04-27-kol-profile-cache',
+    description: 'Cache scraped KOL profiles for 7 days so repeat lookups (Pipeline restart, KOL Database refresh) skip the Apify cost.',
+    up: async ({ exec }) => {
+      await exec(`
+        CREATE TABLE IF NOT EXISTS kol_profile_cache (
+          id TEXT PRIMARY KEY,
+          platform TEXT NOT NULL,
+          username TEXT NOT NULL,
+          profile_data TEXT NOT NULL,
+          source TEXT,
+          cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          expires_at TIMESTAMP NOT NULL
+        )
+      `);
+      for (const stmt of [
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_kol_cache_lookup ON kol_profile_cache(platform, username)',
+        'CREATE INDEX IF NOT EXISTS idx_kol_cache_expires ON kol_profile_cache(expires_at)',
+      ]) {
+        try { await exec(stmt); } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      }
+    },
+  },
+
+  {
+    id: '2026-05-01-hash-invitation-tokens',
+    description: 'Backfill: rewrite plaintext invitation tokens as sha256 hashes so a DB leak cannot enumerate active invitations (audit S-5). Idempotent — only rewrites rows whose token length != 64 hex chars.',
+    up: async ({ exec, query }) => {
+      const crypto = require('crypto');
+      try {
+        const r = await query("SELECT id, token FROM invitations WHERE accepted_at IS NULL");
+        const rows = r.rows || [];
+        for (const row of rows) {
+          if (!row.token) continue;
+          // sha256 hex digest is exactly 64 chars. If we see anything else,
+          // assume it's plaintext and hash it. This means re-running this
+          // migration is a no-op (idempotent).
+          if (row.token.length === 64 && /^[0-9a-f]+$/i.test(row.token)) continue;
+          const hash = crypto.createHash('sha256').update(row.token).digest('hex');
+          await exec('UPDATE invitations SET token = ? WHERE id = ?', [hash, row.id]);
+        }
+      } catch (e) {
+        // Table may not exist on a brand-new database — that's fine, the
+        // base migration will create it with hashed-from-day-one tokens.
+        if (!/no such table|does not exist/i.test(e.message)) throw e;
+      }
+    },
+  },
+
+  {
+    id: '2026-08-09-workspace-id-not-null',
+    description: 'Enforce workspace_id NOT NULL on multi-tenant tables (Postgres only; per-table, skipped when orphan rows exist). Closes the gap that let NULL-workspace rows be written silently — see docs/MULTITENANCY.md §2.',
+    up: async ({ exec, query, usePostgres }) => {
+      // SQLite has no ALTER COLUMN ... SET NOT NULL; enforcing it there would
+      // mean a full table rebuild (create/copy/drop/rename) per table, which
+      // risks data loss on the dev/test path for no production benefit —
+      // production is Postgres. SQLite keeps the runtime guards only.
+      // Callers that don't declare a driver (tests, seed script) are SQLite.
+      if (!usePostgres) return;
+
+      for (const table of MULTITENANT_TABLES) {
+        let orphans;
+        try {
+          const r = await query(`SELECT COUNT(*) AS n FROM ${table} WHERE workspace_id IS NULL`);
+          orphans = parseInt((r.rows && r.rows[0] && r.rows[0].n) || 0, 10);
+        } catch (e) {
+          // Table may not exist in this deployment — nothing to constrain.
+          if (/does not exist|no such table/i.test(e.message)) continue;
+          throw e;
+        }
+
+        if (orphans > 0) {
+          // Do NOT fail the boot: an orphan row is a data-quality problem for
+          // an operator to triage (the rows are already invisible to every
+          // workspace-scoped read), not a reason to take the service down.
+          // Re-running this migration later, after cleanup, is a no-op for
+          // tables already constrained.
+          console.warn(
+            `[migrations] ${table}: ${orphans} row(s) with NULL workspace_id — leaving column nullable. ` +
+            `Assign or delete those rows, then re-run this migration id after removing it from schema_migrations.`
+          );
+          continue;
+        }
+
+        try {
+          await exec(`ALTER TABLE ${table} ALTER COLUMN workspace_id SET NOT NULL`);
+        } catch (e) {
+          // Already NOT NULL (re-run) — Postgres is a no-op here, but be
+          // tolerant of any driver that reports it as an error.
+          if (!/already|cannot be cast|does not exist/i.test(e.message)) throw e;
+        }
+      }
+    },
+  },
+
+  {
+    id: '2026-08-09-hash-session-tokens',
+    description: 'Store sha256(session token) in sessions.token_hash instead of keeping the raw bearer token as sessions.id (audit P2). Existing rows cannot be converted — the stored value IS the secret — so they keep id=<plaintext>, token_hash=NULL and are matched by auth.js\'s legacy branch until they expire (<= 7 days). Nobody is logged out.',
+    up: async ({ exec }) => {
+      // `sessions` is created by the base schema, not by a migration, so a
+      // harness that boots a partial database (see multitenancy.test.js) may
+      // not have it. Nothing to migrate in that case.
+      const missingTable = (e) => /no such table|does not exist|undefined table/i.test(e.message);
+      try {
+        await exec('ALTER TABLE sessions ADD COLUMN token_hash TEXT');
+      } catch (e) {
+        if (missingTable(e)) return;
+        if (!/duplicate|already exists/i.test(e.message)) throw e;
+      }
+      // UNIQUE so two sessions can never share a hash; NULLs are exempt in
+      // both SQLite and Postgres, which is what lets the legacy rows coexist.
+      try {
+        await exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash)');
+      } catch (e) {
+        if (!missingTable(e) && !/already exists/i.test(e.message)) throw e;
+      }
+      // Drop rows that are already expired so the legacy (plaintext) window
+      // is as small as possible.
+      try {
+        await exec('DELETE FROM sessions WHERE expires_at < CURRENT_TIMESTAMP');
+      } catch { /* best-effort cleanup */ }
+    },
+  },
+
+  {
+    id: '2026-08-10-creators-public-marketplace',
+    description: 'Creator Marketplace catalog (roadmap D2). Cross-workspace, public-profile fields ONLY — no email, no contact info, no campaign linkage. Every row carries provenance (which workspace contributed it, when, and that the source is a public profile page) per ROADMAP_2026-Q2 §5 "Marketplace 种子数据合规". Seeds a handful of unmistakably-labelled sample rows so /marketplace is demonstrable on an empty install; set MARKETPLACE_SAMPLE_DATA=false to skip them.',
+    up: async ({ exec, query }) => {
+      // NOT multi-tenant on purpose: this is the one shared table in the
+      // schema. It is deliberately absent from MULTITENANT_TABLES and from
+      // database.js's scoped() path — see server/marketplace.js for the
+      // full reasoning and the field allowlist that keeps it public-only.
+      //
+      // `source` records HOW the row was obtained, not who it is about:
+      //   'public_profile' — promoted from a workspace's own scraped
+      //                      kol_database row, whose data came off the
+      //                      creator's public profile page.
+      //   'sample'         — synthetic demo row, is_sample = 1.
+      // `contributed_by_workspace_id` is provenance for auditing/takedowns.
+      // It is NEVER returned by the API: which workspace is tracking which
+      // creator is itself tenant-private information.
+      await exec(`
+        CREATE TABLE IF NOT EXISTS creators_public (
+          id TEXT PRIMARY KEY,
+          platform TEXT NOT NULL,
+          username TEXT NOT NULL,
+          display_name TEXT,
+          avatar_url TEXT,
+          profile_url TEXT,
+          followers INTEGER DEFAULT 0,
+          engagement_rate REAL DEFAULT 0,
+          category TEXT,
+          source TEXT NOT NULL DEFAULT 'public_profile',
+          contributed_by_workspace_id TEXT,
+          contributed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          is_sample INTEGER DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      for (const stmt of [
+        // One listing per creator per platform. Two workspaces that both
+        // scraped the same channel contribute one row, not two.
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_creators_public_identity ON creators_public(platform, username)',
+        'CREATE INDEX IF NOT EXISTS idx_creators_public_platform ON creators_public(platform)',
+        'CREATE INDEX IF NOT EXISTS idx_creators_public_followers ON creators_public(followers)',
+        'CREATE INDEX IF NOT EXISTS idx_creators_public_category ON creators_public(category)',
+      ]) {
+        try { await exec(stmt); } catch (e) { if (!/already exists/i.test(e.message)) throw e; }
+      }
+
+      // ---- Sample rows -------------------------------------------------
+      // Deliberately NOT 100 invented creators. Fabricating plausible
+      // channel names, follower counts and URLs would put made-up people
+      // in front of users as if they were real, bookable creators. These
+      // six exist only so the page has something to render before any
+      // workspace has contributed; they are flagged is_sample = 1, named
+      // "Sample Creator X", and point at example.com (an IANA-reserved
+      // documentation domain that can never be a real profile).
+      if (String(process.env.MARKETPLACE_SAMPLE_DATA).toLowerCase() === 'false') return;
+
+      const samples = [
+        ['youtube',   'sample-creator-a', 'Sample Creator A', 128000, 4.2, 'gaming'],
+        ['youtube',   'sample-creator-b', 'Sample Creator B', 46000,  6.1, 'tech'],
+        ['tiktok',    'sample-creator-c', 'Sample Creator C', 512000, 8.4, 'beauty'],
+        ['tiktok',    'sample-creator-d', 'Sample Creator D', 9800,   11.3, 'food'],
+        ['instagram', 'sample-creator-e', 'Sample Creator E', 74000,  3.7, 'fitness'],
+        ['instagram', 'sample-creator-f', 'Sample Creator F', 21000,  5.5, 'travel'],
+      ];
+      for (const [platform, username, displayName, followers, engagement, category] of samples) {
+        // Fixed ids keep the migration idempotent and let an operator delete
+        // the sample set with a single predicate (is_sample = 1).
+        const id = `sample-${platform}-${username}`;
+        const existing = await query(
+          'SELECT id FROM creators_public WHERE platform = ? AND username = ?',
+          [platform, username]
+        );
+        if ((existing.rows || []).length > 0) continue;
+        await exec(
+          `INSERT INTO creators_public
+             (id, platform, username, display_name, avatar_url, profile_url,
+              followers, engagement_rate, category, source,
+              contributed_by_workspace_id, is_sample)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'sample', NULL, 1)`,
+          [
+            id, platform, username, displayName,
+            `https://example.com/avatars/${username}.png`,
+            `https://example.com/${platform}/${username}`,
+            followers, engagement, category,
+          ]
+        );
+      }
+    },
+  },
+
+];
+
+// Slugify helper — lowercase, replace non-alphanumeric with dashes,
+// suffix with short UUID fragment for uniqueness.
+function slugify(name, uuid) {
+  const base = (name || 'workspace')
+    .toString()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 40)
+    || 'workspace';
+  const suffix = (uuid || '').replace(/-/g, '').slice(0, 6);
+  return suffix ? `${base}-${suffix}` : base;
+}
+
+async function ensureMigrationsTable({ query, exec }) {
+  // Works on both Postgres and SQLite
+  await exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      id TEXT PRIMARY KEY,
+      description TEXT,
+      applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+}
+
+async function getAppliedMigrations({ query }) {
+  const result = await query('SELECT id FROM schema_migrations');
+  return new Set((result.rows || []).map(r => r.id));
+}
+
+// Postgres advisory-lock id for the migration runner. Arbitrary but fixed —
+// every instance must pick the same number to serialize against each other.
+const MIGRATION_LOCK_ID = 8410771;
+
+/**
+ * Serialize the migration run across instances.
+ *
+ * Two Cloud Run instances cold-starting against a database with pending
+ * migrations both read an empty `applied` set, both run the DDL, and both
+ * INSERT the same id — the loser hits a UNIQUE violation and, because the
+ * boot IIFE rethrows, exits(1). The DDL itself is idempotent (every
+ * migration swallows "already exists"), so the only real damage is the
+ * crash; still, serializing is the correct fix.
+ *
+ * The advisory lock must be taken on a DEDICATED connection: `query()` runs
+ * through a pool, and a session-scoped lock taken on one pooled connection
+ * cannot be released from another. Returns a release function; on SQLite (or
+ * if anything goes wrong) it degrades to a no-op and we rely on the
+ * duplicate-tolerant INSERT below.
+ */
+async function acquireMigrationLock(dbApi) {
+  if (!dbApi.usePostgres) return async () => {};
+  let pool;
+  try {
+    ({ pool } = require('./database'));
+  } catch { return async () => {}; }
+  if (!pool || typeof pool.connect !== 'function') return async () => {};
+
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_ID]);
+  } catch (e) {
+    if (client) client.release();
+    console.warn('[migrations] advisory lock unavailable, continuing unserialized:', e.message);
+    return async () => {};
+  }
+  return async () => {
+    try { await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_ID]); }
+    catch { /* connection is being released anyway */ }
+    client.release();
+  };
+}
+
+function isDuplicateKeyError(e) {
+  return /duplicate key|unique constraint|UNIQUE constraint failed/i.test(e.message || '');
+}
+
+async function runPendingMigrations(dbApi) {
+  // Audit D-4: flag duplicate IDs (a copy-paste / merge-conflict bug that
+  // would otherwise silently skip the second occurrence). We don't enforce
+  // strict date ordering because some migrations (e.g. multitenancy-init)
+  // are intentionally placed after later-dated peers because they backfill
+  // columns into tables those peers create.
+  const seen = new Set();
+  for (const m of MIGRATIONS) {
+    if (seen.has(m.id)) throw new Error(`[migrations] duplicate id: "${m.id}"`);
+    seen.add(m.id);
+  }
+
+  await ensureMigrationsTable(dbApi);
+  const releaseLock = await acquireMigrationLock(dbApi);
+  try {
+    // Read the applied set INSIDE the lock: an instance that queued behind a
+    // peer must see what that peer just applied, not a pre-lock snapshot.
+    const applied = await getAppliedMigrations(dbApi);
+
+    const pending = MIGRATIONS.filter(m => !applied.has(m.id));
+    if (pending.length === 0) {
+      return { applied: 0, total: applied.size };
+    }
+
+    console.log(`[migrations] Running ${pending.length} pending migration(s)...`);
+    let appliedCount = 0;
+    for (const migration of pending) {
+      const start = Date.now();
+      try {
+        await migration.up(dbApi);
+        await dbApi.exec(
+          'INSERT INTO schema_migrations (id, description) VALUES (?, ?)',
+          [migration.id, migration.description || '']
+        );
+        appliedCount++;
+        console.log(`[migrations] ✓ ${migration.id} (${Date.now() - start}ms)`);
+      } catch (e) {
+        if (isDuplicateKeyError(e)) {
+          // Another process recorded this migration while we were running it
+          // (no advisory lock on SQLite; parallel test workers hit this).
+          // Migrations are idempotent, so the DDL running twice is benign —
+          // crashing the boot over the bookkeeping row is not.
+          console.warn(`[migrations] ${migration.id} already recorded by a concurrent process — skipping`);
+          continue;
+        }
+        console.error(`[migrations] ✗ ${migration.id} failed:`, e.message);
+        throw new Error(`Migration ${migration.id} failed: ${e.message}`);
+      }
+    }
+
+    return { applied: appliedCount, total: applied.size + appliedCount };
+  } finally {
+    await releaseLock();
+  }
+}
+
+module.exports = { runPendingMigrations, MIGRATIONS, MULTITENANT_TABLES };

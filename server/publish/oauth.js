@@ -1,0 +1,901 @@
+/**
+ * OAuth 2.0 flows for direct-posting platforms.
+ *
+ * Currently scaffolded:
+ *   - twitter (X) — OAuth 2.0 with PKCE. Requires TWITTER_CLIENT_ID and
+ *     TWITTER_CLIENT_SECRET env vars. Register an app at
+ *     https://developer.twitter.com and enable OAuth 2.0 with scopes:
+ *     tweet.read tweet.write users.read offline.access
+ *   - linkedin — OAuth 2.0. Requires LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET.
+ *     Register at https://www.linkedin.com/developers/ with scopes:
+ *     openid profile w_member_social email
+ *
+ * Without env vars configured, the init endpoint returns 400 with a
+ * human-readable reason.
+ */
+
+const crypto = require('crypto');
+const fetch = require('../proxy-fetch');
+
+const CALLBACK_BASE = process.env.OAUTH_CALLBACK_BASE || 'https://influencexes.com';
+
+const PROVIDERS = {
+  twitter: {
+    id: 'twitter',
+    label: 'X (Twitter)',
+    kind: 'oauth',
+    authUrl: 'https://twitter.com/i/oauth2/authorize',
+    tokenUrl: 'https://api.twitter.com/2/oauth2/token',
+    userInfoUrl: 'https://api.twitter.com/2/users/me',
+    scope: 'tweet.read tweet.write users.read offline.access',
+    usesPKCE: true,
+    clientIdEnv: 'TWITTER_CLIENT_ID',
+    clientSecretEnv: 'TWITTER_CLIENT_SECRET',
+  },
+  linkedin: {
+    id: 'linkedin',
+    label: 'LinkedIn',
+    kind: 'oauth',
+    authUrl: 'https://www.linkedin.com/oauth/v2/authorization',
+    tokenUrl: 'https://www.linkedin.com/oauth/v2/accessToken',
+    userInfoUrl: 'https://api.linkedin.com/v2/userinfo',
+    scope: 'openid profile w_member_social email',
+    usesPKCE: false,
+    clientIdEnv: 'LINKEDIN_CLIENT_ID',
+    clientSecretEnv: 'LINKEDIN_CLIENT_SECRET',
+  },
+  instagram: {
+    id: 'instagram',
+    label: 'Instagram (Business)',
+    kind: 'oauth',
+    // Meta Graph uses Facebook Login; the IG Business account must be linked
+    // to a Facebook Page the user admins.
+    authUrl: 'https://www.facebook.com/v18.0/dialog/oauth',
+    tokenUrl: 'https://graph.facebook.com/v18.0/oauth/access_token',
+    // Resolved per-account via /me/accounts → page → instagram_business_account.
+    userInfoUrl: null,
+    scope: 'instagram_basic,instagram_content_publish,pages_show_list,pages_read_engagement',
+    usesPKCE: false,
+    clientIdEnv: 'META_APP_ID',
+    clientSecretEnv: 'META_APP_SECRET',
+  },
+  youtube: {
+    id: 'youtube',
+    label: 'YouTube',
+    kind: 'oauth',
+    // Google OAuth 2.0. Separate client from Google SSO (GOOGLE_OAUTH_*) because
+    // YouTube requires Data API v3 + YouTube Analytics API enabled on the GCP
+    // project and the scopes below, which we don't want to grant for plain SSO.
+    authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    // channels.list(mine=true) returns the connected channel's id + snippet.title.
+    userInfoUrl: 'https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true',
+    scope: 'https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/yt-analytics.readonly',
+    usesPKCE: true,
+    clientIdEnv: 'YOUTUBE_CLIENT_ID',
+    clientSecretEnv: 'YOUTUBE_CLIENT_SECRET',
+    // Google only issues a refresh_token when access_type=offline + prompt=consent.
+    extraAuthParams: { access_type: 'offline', prompt: 'consent', include_granted_scopes: 'true' },
+  },
+  gmail: {
+    id: 'gmail',
+    label: 'Gmail',
+    kind: 'oauth',
+    // Separate OAuth client from Google SSO and YouTube. Scope is restricted
+    // (`gmail.send`) so the Google Cloud project must pass OAuth verification
+    // before non-test-users can connect. category='email' keeps it out of
+    // the publishDirect dispatcher — Gmail is used by server/email.js, not
+    // as a publishing target.
+    category: 'email',
+    authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    userInfoUrl: 'https://www.googleapis.com/oauth2/v2/userinfo',
+    // Send-only. Reading/drafts would broaden the scope to restricted-sensitive
+    // territory and slow verification significantly.
+    scope: 'https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email openid',
+    usesPKCE: true,
+    clientIdEnv: 'GMAIL_OAUTH_CLIENT_ID',
+    clientSecretEnv: 'GMAIL_OAUTH_CLIENT_SECRET',
+    // Tokens are encrypted at rest with MAILBOX_ENCRYPTION_KEY (see server/index.js callback).
+    encryptTokens: true,
+    extraAuthParams: { access_type: 'offline', prompt: 'consent', include_granted_scopes: 'true' },
+  },
+  tiktok: {
+    id: 'tiktok',
+    label: 'TikTok',
+    kind: 'oauth',
+    // TikTok Login Kit v2. Requires TikTok for Developers app with Content
+    // Posting API enabled for video.publish scope.
+    authUrl: 'https://www.tiktok.com/v2/auth/authorize/',
+    tokenUrl: 'https://open.tiktokapis.com/v2/oauth/token/',
+    userInfoUrl: 'https://open.tiktokapis.com/v2/user/info/?fields=open_id,union_id,avatar_url,display_name,username',
+    scope: 'user.info.basic,video.upload,video.publish',
+    usesPKCE: true,
+    clientIdEnv: 'TIKTOK_CLIENT_KEY',
+    clientSecretEnv: 'TIKTOK_CLIENT_SECRET',
+    // TikTok's OAuth uses client_key (not client_id) — normalization happens
+    // in buildAuthorizeUrl when we see this provider.
+    clientIdParam: 'client_key',
+  },
+  threads: {
+    id: 'threads',
+    label: 'Threads',
+    kind: 'oauth',
+    // Meta Threads API. Separate app from Instagram/Facebook because scopes
+    // and product configuration differ.
+    authUrl: 'https://threads.net/oauth/authorize',
+    tokenUrl: 'https://graph.threads.net/oauth/access_token',
+    userInfoUrl: 'https://graph.threads.net/v1.0/me?fields=id,username,threads_profile_picture_url',
+    scope: 'threads_basic,threads_content_publish',
+    usesPKCE: false,
+    clientIdEnv: 'THREADS_APP_ID',
+    clientSecretEnv: 'THREADS_APP_SECRET',
+  },
+  facebook: {
+    id: 'facebook',
+    label: 'Facebook (Pages)',
+    kind: 'oauth',
+    // Reuses the META_APP_* credentials because Facebook + Instagram live on
+    // the same app. Scopes differ from IG — Pages API requires pages_manage_posts.
+    authUrl: 'https://www.facebook.com/v18.0/dialog/oauth',
+    tokenUrl: 'https://graph.facebook.com/v18.0/oauth/access_token',
+    userInfoUrl: null, // resolved via /me/accounts like Instagram
+    scope: 'pages_show_list,pages_manage_posts,pages_read_engagement',
+    usesPKCE: false,
+    clientIdEnv: 'META_APP_ID',
+    clientSecretEnv: 'META_APP_SECRET',
+  },
+  pinterest: {
+    id: 'pinterest',
+    label: 'Pinterest',
+    kind: 'oauth',
+    // Pinterest API v5. Requires developer app with "Trial" or "Standard" tier.
+    authUrl: 'https://www.pinterest.com/oauth/',
+    tokenUrl: 'https://api.pinterest.com/v5/oauth/token',
+    userInfoUrl: 'https://api.pinterest.com/v5/user_account',
+    scope: 'boards:read,pins:read,pins:write,user_accounts:read',
+    usesPKCE: true,
+    clientIdEnv: 'PINTEREST_APP_ID',
+    clientSecretEnv: 'PINTEREST_APP_SECRET',
+  },
+  reddit: {
+    id: 'reddit',
+    label: 'Reddit',
+    kind: 'oauth',
+    // Reddit OAuth 2.0. duration=permanent gets a refresh_token.
+    authUrl: 'https://www.reddit.com/api/v1/authorize',
+    tokenUrl: 'https://www.reddit.com/api/v1/access_token',
+    userInfoUrl: 'https://oauth.reddit.com/api/v1/me',
+    scope: 'identity submit read',
+    usesPKCE: false,
+    clientIdEnv: 'REDDIT_CLIENT_ID',
+    clientSecretEnv: 'REDDIT_CLIENT_SECRET',
+    extraAuthParams: { duration: 'permanent' },
+  },
+  // --- API-key-based blog platforms. No OAuth dance — the user provides
+  // credentials directly and we store them in platform_connections. The
+  // "configured" flag is always true; configuration happens per-user.
+  medium: {
+    id: 'medium',
+    label: 'Medium',
+    kind: 'api_key',
+    fields: [
+      { name: 'integration_token', label: 'Integration Token', type: 'password',
+        help: 'Create at https://medium.com/me/settings → Integration tokens' },
+    ],
+  },
+  ghost: {
+    id: 'ghost',
+    label: 'Ghost',
+    kind: 'api_key',
+    fields: [
+      { name: 'site_url', label: 'Ghost Site URL', type: 'text',
+        help: 'e.g. https://yoursite.ghost.io — no trailing slash' },
+      { name: 'admin_api_key', label: 'Admin API Key', type: 'password',
+        help: 'Ghost Admin → Integrations → Add custom integration' },
+    ],
+  },
+  wordpress: {
+    id: 'wordpress',
+    label: 'WordPress',
+    kind: 'api_key',
+    fields: [
+      { name: 'site_url', label: 'Site URL', type: 'text',
+        help: 'e.g. https://yoursite.com — self-hosted WP with REST API enabled' },
+      { name: 'username', label: 'Username', type: 'text' },
+      { name: 'application_password', label: 'Application Password', type: 'password',
+        help: 'WP Admin → Users → Profile → Application Passwords' },
+    ],
+  },
+};
+
+function getProvider(name) {
+  return PROVIDERS[name] || null;
+}
+
+function isConfigured(name) {
+  const p = PROVIDERS[name];
+  if (!p) return false;
+  if (p.kind === 'api_key') return true; // User provides creds directly
+  return !!(process.env[p.clientIdEnv] && process.env[p.clientSecretEnv]);
+}
+
+function listProviders() {
+  return Object.values(PROVIDERS).map(p => ({
+    id: p.id,
+    label: p.label,
+    kind: p.kind || 'oauth',
+    configured: isConfigured(p.id),
+    scope: p.scope || null,
+    fields: p.fields || null,
+  }));
+}
+
+function base64urlEncode(buf) {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function generatePKCE() {
+  const verifier = base64urlEncode(crypto.randomBytes(32));
+  const challenge = base64urlEncode(crypto.createHash('sha256').update(verifier).digest());
+  return { verifier, challenge };
+}
+
+/**
+ * Build the authorization URL the user is redirected to.
+ * Returns { url, state, codeVerifier } — caller persists state+verifier and
+ * looks them up on callback to exchange the code.
+ */
+function buildAuthorizeUrl(providerName, { workspaceId, userId, redirectUri }) {
+  const p = getProvider(providerName);
+  if (!p) throw new Error(`Unknown provider: ${providerName}`);
+  if (!isConfigured(providerName)) {
+    throw new Error(`${p.label} not configured (missing ${p.clientIdEnv} / ${p.clientSecretEnv})`);
+  }
+
+  const state = crypto.randomBytes(16).toString('hex');
+  const redirect = redirectUri || `${CALLBACK_BASE}/api/publish/oauth/${p.id}/callback`;
+  // Most providers use `client_id`; TikTok uses `client_key`. Let the config
+  // declare the param name so we don't branch per provider here.
+  const clientIdParam = p.clientIdParam || 'client_id';
+  const params = new URLSearchParams({
+    response_type: 'code',
+    [clientIdParam]: process.env[p.clientIdEnv],
+    redirect_uri: redirect,
+    scope: p.scope,
+    state,
+  });
+
+  let codeVerifier = null;
+  if (p.usesPKCE) {
+    const { verifier, challenge } = generatePKCE();
+    codeVerifier = verifier;
+    params.set('code_challenge', challenge);
+    params.set('code_challenge_method', 'S256');
+  }
+
+  if (p.extraAuthParams) {
+    for (const [k, v] of Object.entries(p.extraAuthParams)) params.set(k, v);
+  }
+
+  return {
+    url: `${p.authUrl}?${params.toString()}`,
+    state,
+    codeVerifier,
+    redirect,
+  };
+}
+
+/**
+ * Exchange an authorization code for an access token.
+ */
+async function exchangeCodeForToken(providerName, { code, redirectUri, codeVerifier }) {
+  const p = getProvider(providerName);
+  if (!p) throw new Error(`Unknown provider: ${providerName}`);
+
+  const clientId = process.env[p.clientIdEnv];
+  const clientSecret = process.env[p.clientSecretEnv];
+
+  const clientIdParam = p.clientIdParam || 'client_id';
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirectUri,
+    [clientIdParam]: clientId,
+  });
+  if (p.usesPKCE && codeVerifier) {
+    body.set('code_verifier', codeVerifier);
+  }
+
+  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  if (providerName === 'twitter' || providerName === 'reddit') {
+    // Twitter + Reddit use HTTP Basic auth for confidential-client token exchange.
+    const basic = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+    headers['Authorization'] = `Basic ${basic}`;
+    if (providerName === 'reddit') headers['User-Agent'] = 'influencex/1.0';
+  } else if (providerName === 'tiktok') {
+    body.set('client_secret', clientSecret);
+    body.set('client_key', clientId);
+  } else {
+    body.set('client_secret', clientSecret);
+  }
+
+  // Meta's token endpoint accepts GET with query params; POST also works but
+  // some SDKs report quirks. We stay with POST form-encoded for consistency.
+  const res = await fetch(p.tokenUrl, { method: 'POST', headers, body: body.toString() });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`${p.label} token exchange ${res.status}: ${text.slice(0, 300)}`);
+  }
+  const data = await res.json();
+
+  // Fetch account info
+  let accountName = null, accountId = null;
+  let accessToken = data.access_token;
+  let expiresIn = data.expires_in || null;
+  let metadata = null;
+
+  if (providerName === 'facebook') {
+    // Facebook Pages flow: exchange to long-lived user token, list /me/accounts,
+    // store the first Page's id + its page access token. Scope must include
+    // pages_manage_posts for publishing.
+    try {
+      const llRes = await fetch(
+        `https://graph.facebook.com/v18.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}&fb_exchange_token=${encodeURIComponent(data.access_token)}`
+      );
+      if (llRes.ok) {
+        const ll = await llRes.json();
+        if (ll.access_token) { accessToken = ll.access_token; expiresIn = ll.expires_in || expiresIn; }
+      }
+      const pagesRes = await fetch(
+        `https://graph.facebook.com/v18.0/me/accounts?fields=id,name,access_token&access_token=${encodeURIComponent(accessToken)}`
+      );
+      if (pagesRes.ok) {
+        const pages = await pagesRes.json();
+        const page = (pages.data || [])[0];
+        if (page) {
+          accessToken = page.access_token || accessToken;
+          accountId = page.id;
+          accountName = page.name;
+          metadata = { page_id: page.id, page_name: page.name };
+        }
+      }
+    } catch { /* ok, optional */ }
+  } else if (providerName === 'instagram') {
+    // Meta flow: short-lived user token → long-lived user token → pick Page →
+    // read its `instagram_business_account`. We store the Page access token
+    // (long-lived) and the IG Business user id.
+    try {
+      const llRes = await fetch(
+        `https://graph.facebook.com/v18.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}&fb_exchange_token=${encodeURIComponent(data.access_token)}`
+      );
+      if (llRes.ok) {
+        const ll = await llRes.json();
+        if (ll.access_token) { accessToken = ll.access_token; expiresIn = ll.expires_in || expiresIn; }
+      }
+      const pagesRes = await fetch(
+        `https://graph.facebook.com/v18.0/me/accounts?fields=id,name,access_token,instagram_business_account&access_token=${encodeURIComponent(accessToken)}`
+      );
+      if (pagesRes.ok) {
+        const pages = await pagesRes.json();
+        const linked = (pages.data || []).find(pg => pg.instagram_business_account?.id);
+        if (linked) {
+          accessToken = linked.access_token || accessToken;
+          accountId = linked.instagram_business_account.id;
+          metadata = { page_id: linked.id, page_name: linked.name, ig_user_id: accountId };
+          // Resolve IG username for display
+          try {
+            const igRes = await fetch(
+              `https://graph.facebook.com/v18.0/${accountId}?fields=username&access_token=${encodeURIComponent(accessToken)}`
+            );
+            if (igRes.ok) {
+              const ig = await igRes.json();
+              accountName = ig.username ? `@${ig.username}` : linked.name;
+            } else {
+              accountName = linked.name;
+            }
+          } catch { accountName = linked.name; }
+        }
+      }
+    } catch { /* ok, optional */ }
+  } else if (p.userInfoUrl) {
+    try {
+      const userInfoHeaders = { 'Authorization': `Bearer ${accessToken}` };
+      if (providerName === 'reddit') userInfoHeaders['User-Agent'] = 'influencex/1.0';
+      const userRes = await fetch(p.userInfoUrl, { headers: userInfoHeaders });
+      if (userRes.ok) {
+        const user = await userRes.json();
+        if (providerName === 'twitter') {
+          accountId = user.data?.id;
+          accountName = user.data?.username || user.data?.name;
+        } else if (providerName === 'linkedin') {
+          accountId = user.sub;
+          accountName = user.name || user.email;
+        } else if (providerName === 'youtube') {
+          const channel = (user.items || [])[0];
+          if (channel) {
+            accountId = channel.id;
+            accountName = channel.snippet?.title || channel.snippet?.customUrl || null;
+            metadata = {
+              channel_id: channel.id,
+              channel_handle: channel.snippet?.customUrl || null,
+              country: channel.snippet?.country || null,
+            };
+          }
+        } else if (providerName === 'gmail') {
+          // userinfo returns { id, email, verified_email, ... }. We use email
+          // as both account_id (stable) and account_name (user-facing).
+          accountId = user.email || user.id || null;
+          accountName = user.email || null;
+          metadata = { email: user.email, verified: !!user.verified_email };
+        } else if (providerName === 'tiktok') {
+          accountId = user.data?.user?.open_id || user.data?.user?.union_id || null;
+          accountName = user.data?.user?.display_name || user.data?.user?.username || null;
+          metadata = {
+            open_id: user.data?.user?.open_id,
+            union_id: user.data?.user?.union_id,
+            avatar_url: user.data?.user?.avatar_url,
+          };
+        } else if (providerName === 'threads') {
+          accountId = user.id;
+          accountName = user.username ? `@${user.username}` : null;
+        } else if (providerName === 'pinterest') {
+          accountId = user.id || user.username;
+          accountName = user.username ? `@${user.username}` : null;
+        } else if (providerName === 'reddit') {
+          accountId = user.id;
+          accountName = user.name ? `u/${user.name}` : null;
+        }
+      }
+    } catch { /* ok, optional */ }
+  }
+
+  return {
+    access_token: accessToken,
+    refresh_token: data.refresh_token || null,
+    expires_in: expiresIn,
+    scope: data.scope || p.scope,
+    token_type: data.token_type || 'Bearer',
+    account_name: accountName,
+    account_id: accountId,
+    metadata,
+  };
+}
+
+/**
+ * Post content directly to the platform using a stored access token.
+ * Returns { success, platform_post_id?, url?, error? }.
+ */
+async function publishDirect(providerName, credentials, payload) {
+  const { text, title, imageUrl, tags, accountId } = payload || {};
+  // For OAuth providers, `credentials` is an access token (string).
+  // For API-key providers, `credentials` is a JSON object with the fields
+  // captured at connection time (decoded from platform_connections.metadata).
+  if (providerName === 'twitter')   return publishTwitter(credentials, { text });
+  if (providerName === 'linkedin')  return publishLinkedIn(credentials, { text });
+  if (providerName === 'instagram') return publishInstagram(credentials, { text, imageUrl, igUserId: accountId });
+  if (providerName === 'youtube')   return publishYouTube(credentials, { title, text, videoUrl: payload?.video_url || payload?.videoUrl, tags, privacyStatus: payload?.privacy_status || payload?.privacyStatus });
+  if (providerName === 'facebook')  return publishFacebook(credentials, { text, linkUrl: payload?.link_url || payload?.linkUrl, pageId: accountId });
+  if (providerName === 'threads')   return publishThreads(credentials, { text, imageUrl, threadsUserId: accountId });
+  if (providerName === 'tiktok')    return publishTikTok(credentials, { text, videoUrl: payload?.video_url || payload?.videoUrl });
+  if (providerName === 'pinterest') return publishPinterest(credentials, { text, title, imageUrl, boardId: payload?.board_id || payload?.boardId });
+  if (providerName === 'reddit')    return publishReddit(credentials, { text, title, subreddit: payload?.subreddit });
+  if (providerName === 'medium')    return publishMedium(credentials, { text, title, tags });
+  if (providerName === 'ghost')     return publishGhost(credentials, { text, title, tags });
+  if (providerName === 'wordpress') return publishWordPress(credentials, { text, title, tags });
+  return { success: false, error: `Direct publishing not implemented for ${providerName}` };
+}
+
+// --- Shared connectors (packages/social-ops) -----------------------------
+// X / Instagram / YouTube / TikTok / Reddit are implemented ONCE in
+// packages/social-ops (the credential-free capability layer other hosts
+// consume) and re-used here with this module's proxy-aware fetch. The legacy
+// { success, platform_post_id, url, error } result shape is preserved for the
+// publisher agent, scheduled-publish and the /api/publish/direct route.
+
+const socialOps = require('../../packages/social-ops');
+const SOCIAL_OPS_DEPS = { fetch, userAgent: 'influencex/1.0' };
+
+function legacyResult(r) {
+  if (!r) return { success: false, error: 'no result from connector' };
+  if (!r.success) return { success: false, error: r.error, retryable: r.retryable === true };
+  return { success: true, platform_post_id: r.externalId || null, url: r.url || null, status: r.status || 'published' };
+}
+
+async function publishTwitter(accessToken, { text }) {
+  return legacyResult(await socialOps.connectors.getConnector('x').publish({ accessToken }, { text }, SOCIAL_OPS_DEPS));
+}
+
+async function publishInstagram(accessToken, { text, imageUrl, igUserId }) {
+  // resolveUrl:false keeps the legacy two-call container→publish flow.
+  return legacyResult(await socialOps.connectors.getConnector('instagram').publish({ accessToken, igUserId }, { text, imageUrl, resolveUrl: false }, SOCIAL_OPS_DEPS));
+}
+
+async function publishYouTube(accessToken, { title, text, videoUrl, tags, privacyStatus }) {
+  return legacyResult(await socialOps.connectors.getConnector('youtube').publish({ accessToken }, { title, text, videoUrl, tags, privacyStatus }, SOCIAL_OPS_DEPS));
+}
+
+async function publishTikTok(accessToken, { text, videoUrl }) {
+  return legacyResult(await socialOps.connectors.getConnector('tiktok').publish({ accessToken }, { text, videoUrl }, SOCIAL_OPS_DEPS));
+}
+
+async function publishReddit(accessToken, { text, title, subreddit }) {
+  return legacyResult(await socialOps.connectors.getConnector('reddit').publish({ accessToken }, { text, title, subreddit }, SOCIAL_OPS_DEPS));
+}
+
+async function publishLinkedIn(accessToken, { text }) {
+  // LinkedIn's /v2/ugcPosts requires the user's urn:li:person id; we need to
+  // fetch it from /v2/userinfo since we didn't store it. Minimal impl:
+  const meRes = await fetch('https://api.linkedin.com/v2/userinfo', {
+    headers: { 'Authorization': `Bearer ${accessToken}` },
+  });
+  if (!meRes.ok) return { success: false, error: 'Failed to resolve LinkedIn user id' };
+  const me = await meRes.json();
+  const authorUrn = `urn:li:person:${me.sub}`;
+
+  const res = await fetch('https://api.linkedin.com/v2/ugcPosts', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${accessToken}`,
+      'X-Restli-Protocol-Version': '2.0.0',
+    },
+    body: JSON.stringify({
+      author: authorUrn,
+      lifecycleState: 'PUBLISHED',
+      specificContent: {
+        'com.linkedin.ugc.ShareContent': {
+          shareCommentary: { text },
+          shareMediaCategory: 'NONE',
+        },
+      },
+      visibility: { 'com.linkedin.ugc.MemberNetworkVisibility': 'PUBLIC' },
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    return { success: false, error: `LinkedIn API ${res.status}: ${errText.slice(0, 300)}` };
+  }
+  const data = await res.json();
+  return {
+    success: true,
+    platform_post_id: data.id,
+  };
+}
+
+// --- Facebook (Pages) ---------------------------------------------------
+
+/**
+ * Publish to a Facebook Page feed. Requires pages_manage_posts and the Page
+ * access token (captured during exchangeCodeForToken via /me/accounts). Text
+ * posts are supported directly; linkUrl gets attached as a link attachment.
+ */
+async function publishFacebook(accessToken, { text, linkUrl, pageId }) {
+  if (!pageId) return { success: false, error: 'Facebook connection missing page_id (reconnect account)' };
+  const params = new URLSearchParams({ access_token: accessToken });
+  if (text) params.set('message', text);
+  if (linkUrl) params.set('link', linkUrl);
+  const res = await fetch(
+    `https://graph.facebook.com/v18.0/${encodeURIComponent(pageId)}/feed`,
+    { method: 'POST', body: params }
+  );
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    return { success: false, error: `Facebook API ${res.status}: ${t.slice(0, 300)}` };
+  }
+  const data = await res.json();
+  const postId = data.id;
+  // Post id format: "{page_id}_{post_id}" — strip to get the tail for the URL.
+  const tail = (postId || '').split('_').pop();
+  return {
+    success: true,
+    platform_post_id: postId || null,
+    url: tail ? `https://www.facebook.com/${pageId}/posts/${tail}` : null,
+  };
+}
+
+// --- Threads (Meta) -----------------------------------------------------
+
+/**
+ * Threads publishing mirrors Instagram's two-step pattern:
+ *   1) POST /{threads-user-id}/threads with media_type=TEXT (or IMAGE) → creation id
+ *   2) POST /{threads-user-id}/threads_publish with creation_id         → post id
+ *
+ * Images require a public image_url that Meta can fetch server-side.
+ */
+async function publishThreads(accessToken, { text, imageUrl, threadsUserId }) {
+  if (!threadsUserId) return { success: false, error: 'Threads connection missing user id (reconnect account)' };
+  if (!text && !imageUrl) return { success: false, error: 'Threads post requires text or image_url' };
+
+  const createParams = new URLSearchParams({ access_token: accessToken });
+  if (imageUrl) {
+    createParams.set('media_type', 'IMAGE');
+    createParams.set('image_url', imageUrl);
+    if (text) createParams.set('text', text);
+  } else {
+    createParams.set('media_type', 'TEXT');
+    createParams.set('text', text);
+  }
+
+  const createRes = await fetch(
+    `https://graph.threads.net/v1.0/${encodeURIComponent(threadsUserId)}/threads`,
+    { method: 'POST', body: createParams }
+  );
+  if (!createRes.ok) {
+    const t = await createRes.text().catch(() => '');
+    return { success: false, error: `Threads create ${createRes.status}: ${t.slice(0, 300)}` };
+  }
+  const createData = await createRes.json();
+  const creationId = createData.id;
+  if (!creationId) return { success: false, error: 'Threads create returned no id' };
+
+  const publishParams = new URLSearchParams({
+    creation_id: creationId,
+    access_token: accessToken,
+  });
+  const pubRes = await fetch(
+    `https://graph.threads.net/v1.0/${encodeURIComponent(threadsUserId)}/threads_publish`,
+    { method: 'POST', body: publishParams }
+  );
+  if (!pubRes.ok) {
+    const t = await pubRes.text().catch(() => '');
+    return { success: false, error: `Threads publish ${pubRes.status}: ${t.slice(0, 300)}` };
+  }
+  const pubData = await pubRes.json();
+  return {
+    success: true,
+    platform_post_id: pubData.id || null,
+    url: pubData.id ? `https://www.threads.net/t/${pubData.id}` : null,
+  };
+}
+
+// --- Pinterest (v5 API) -------------------------------------------------
+
+/**
+ * Create a Pin on a given board. Requires pins:write scope. The imageUrl must
+ * be publicly fetchable — Pinterest downloads it server-side.
+ */
+async function publishPinterest(accessToken, { text, title, imageUrl, boardId }) {
+  if (!boardId) return { success: false, error: 'Pinterest requires board_id (pick a board at publish time)' };
+  if (!imageUrl) return { success: false, error: 'Pinterest requires image_url — text-only pins are not supported' };
+  const body = {
+    board_id: boardId,
+    title: (title || (text || '').split('\n')[0] || 'Untitled').slice(0, 100),
+    description: (text || '').slice(0, 800),
+    media_source: { source_type: 'image_url', url: imageUrl },
+  };
+  const res = await fetch('https://api.pinterest.com/v5/pins', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    return { success: false, error: `Pinterest API ${res.status}: ${t.slice(0, 300)}` };
+  }
+  const data = await res.json();
+  return {
+    success: true,
+    platform_post_id: data.id || null,
+    url: data.id ? `https://www.pinterest.com/pin/${data.id}/` : null,
+  };
+}
+
+// --- Blog platforms ------------------------------------------------------
+
+async function publishMedium(creds, { text, title, tags }) {
+  const token = typeof creds === 'string' ? creds : creds.integration_token;
+  if (!token) return { success: false, error: 'Medium integration_token missing' };
+  // Resolve user id
+  const meRes = await fetch('https://api.medium.com/v1/me', {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!meRes.ok) return { success: false, error: `Medium /me ${meRes.status}` };
+  const me = await meRes.json();
+  const userId = me?.data?.id;
+  if (!userId) return { success: false, error: 'Medium could not resolve user id' };
+
+  const res = await fetch(`https://api.medium.com/v1/users/${userId}/posts`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      title: title || (text || '').split('\n')[0].slice(0, 100) || 'Untitled',
+      contentFormat: 'markdown',
+      content: text,
+      tags: Array.isArray(tags) ? tags.slice(0, 5) : [],
+      publishStatus: 'public',
+    }),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    return { success: false, error: `Medium API ${res.status}: ${t.slice(0, 300)}` };
+  }
+  const data = await res.json();
+  return { success: true, platform_post_id: data.data?.id, url: data.data?.url };
+}
+
+async function publishGhost(creds, { text, title, tags }) {
+  const siteUrl = (creds.site_url || '').replace(/\/$/, '');
+  const adminKey = creds.admin_api_key;
+  if (!siteUrl || !adminKey) return { success: false, error: 'Ghost site_url and admin_api_key required' };
+
+  // Ghost admin key format: "<id>:<secret>". Build a short-lived JWT.
+  const [keyid, secret] = adminKey.split(':');
+  if (!keyid || !secret) return { success: false, error: 'Invalid Ghost admin key format (expected id:secret)' };
+  const header = base64urlEncode(Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT', kid: keyid })));
+  const now = Math.floor(Date.now() / 1000);
+  const payload = base64urlEncode(Buffer.from(JSON.stringify({ iat: now, exp: now + 300, aud: '/admin/' })));
+  const sigBase = `${header}.${payload}`;
+  const sig = base64urlEncode(
+    crypto.createHmac('sha256', Buffer.from(secret, 'hex')).update(sigBase).digest()
+  );
+  const token = `${sigBase}.${sig}`;
+
+  const endpoint = `${siteUrl}/ghost/api/admin/posts/?source=html`;
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Ghost ${token}` },
+    body: JSON.stringify({
+      posts: [{
+        title: title || (text || '').split('\n')[0].slice(0, 100) || 'Untitled',
+        html: markdownToHtml(text || ''),
+        status: 'published',
+        tags: (Array.isArray(tags) ? tags : []).map(t => ({ name: t })),
+      }],
+    }),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    return { success: false, error: `Ghost API ${res.status}: ${t.slice(0, 300)}` };
+  }
+  const data = await res.json();
+  const post = data.posts?.[0];
+  return { success: true, platform_post_id: post?.id, url: post?.url };
+}
+
+async function publishWordPress(creds, { text, title, tags }) {
+  const siteUrl = (creds.site_url || '').replace(/\/$/, '');
+  if (!siteUrl || !creds.username || !creds.application_password) {
+    return { success: false, error: 'WordPress site_url, username and application_password required' };
+  }
+  const basic = Buffer.from(`${creds.username}:${creds.application_password}`).toString('base64');
+  const endpoint = `${siteUrl}/wp-json/wp/v2/posts`;
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Basic ${basic}` },
+    body: JSON.stringify({
+      title: title || (text || '').split('\n')[0].slice(0, 100) || 'Untitled',
+      content: markdownToHtml(text || ''),
+      status: 'publish',
+    }),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    return { success: false, error: `WordPress API ${res.status}: ${t.slice(0, 300)}` };
+  }
+  const data = await res.json();
+  return { success: true, platform_post_id: String(data.id), url: data.link };
+}
+
+// Minimal markdown → HTML for blog post bodies. Not a full parser — covers
+// the cases the content-text agent actually produces.
+function markdownToHtml(md) {
+  if (!md) return '';
+  let html = md;
+  // Code fences first so we don't process their content.
+  html = html.replace(/```([^\n]*)\n([\s\S]*?)```/g, (_, lang, code) =>
+    `<pre><code class="language-${(lang || '').trim()}">${escapeHtml(code)}</code></pre>`);
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, (_, c) => `<code>${escapeHtml(c)}</code>`);
+  // Headings
+  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>')
+             .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+             .replace(/^# (.+)$/gm, '<h1>$1</h1>');
+  // Bold / italic
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+             .replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  // Links
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+  // Paragraphs: split on blank lines
+  html = html.split(/\n\n+/).map(block => {
+    if (/^<(h\d|pre|ul|ol|blockquote)/.test(block)) return block;
+    return `<p>${block.replace(/\n/g, '<br>')}</p>`;
+  }).join('\n');
+  return html;
+}
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ==================== Connection credential handling (audit S-9) ====================
+//
+// `platform_connections.access_token` / `refresh_token` used to be stored in
+// plaintext for every provider except Gmail, and API-key platforms (Medium,
+// Ghost, WordPress) put their credentials in `metadata` as plaintext JSON —
+// in the same database where we go to the trouble of encrypting mailbox
+// credentials. Everything is now written through encryption.js's `enc:v1:`
+// envelope, and read back through these three helpers.
+//
+// Reads are transparent: `decrypt()` returns any value lacking the prefix
+// unchanged, so rows written before this change keep working and get
+// re-encrypted the next time the connection is written (reconnect / token
+// refresh). No backfill migration needed.
+
+const { encrypt: encryptValue, decrypt: decryptValue } = require('../encryption');
+
+/**
+ * Encrypt a token for storage. null/undefined pass through so we don't turn
+ * "no refresh token" into ciphertext of the string "null".
+ */
+function encryptToken(value) {
+  if (value == null || value === '') return value ?? null;
+  return encryptValue(String(value));
+}
+
+/**
+ * Decrypt a stored token. Legacy plaintext values come back unchanged.
+ * Never throws: a row encrypted under a rotated-away key must not take down
+ * the whole publish path, it should just fail that one platform.
+ */
+function decryptToken(value) {
+  if (value == null) return value;
+  try { return decryptValue(value); } catch { return null; }
+}
+
+/**
+ * The credentials `publishDirect` expects for a connection row:
+ * a decrypted access-token string for OAuth providers, or the decrypted +
+ * parsed metadata object for api_key providers.
+ */
+function credentialsFromConnection(conn) {
+  if (!conn) return null;
+  const provider = getProvider(conn.platform);
+  if (provider?.kind === 'api_key') {
+    const raw = decryptToken(conn.metadata) || '{}';
+    if (typeof raw === 'object') return raw;
+    try { return JSON.parse(raw); } catch { return {}; }
+  }
+  return decryptToken(conn.access_token);
+}
+
+/**
+ * Strip every secret off a connection row before it can reach an API
+ * response, mirroring sanitizeMailbox() in index.js: booleans instead of
+ * values, so the UI can still render "connected / needs reconnect".
+ */
+function sanitizeConnection(conn) {
+  if (!conn) return conn;
+  const { access_token, refresh_token, metadata, ...safe } = conn;
+  let meta = {};
+  if (metadata) {
+    const raw = decryptToken(metadata);
+    if (raw && typeof raw === 'object') meta = raw;
+    else { try { meta = JSON.parse(raw || '{}'); } catch { meta = {}; } }
+  }
+  return {
+    ...safe,
+    has_access_token: !!access_token,
+    has_refresh_token: !!refresh_token,
+    // Non-secret hints only. Field *names* are safe to expose (they come from
+    // our own provider definitions); values are not.
+    metadata_fields: Object.keys(meta).filter(k => meta[k] != null && meta[k] !== ''),
+    site_url: meta.site_url || null,
+  };
+}
+
+module.exports = {
+  PROVIDERS,
+  getProvider,
+  isConfigured,
+  listProviders,
+  buildAuthorizeUrl,
+  exchangeCodeForToken,
+  publishDirect,
+  encryptToken,
+  decryptToken,
+  credentialsFromConnection,
+  sanitizeConnection,
+};

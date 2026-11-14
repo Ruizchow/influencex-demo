@@ -1,0 +1,277 @@
+/**
+ * Token / cost usage ledger (roadmap D5).
+ *
+ * `agent_runs` already records everything a usage ledger needs — workspace,
+ * agent, tokens, cost, timestamps — so this module is pure aggregation: no new
+ * table, no migration. It turns those rows into a month × agent grid plus the
+ * marginal totals, which is what a billing or capacity conversation actually
+ * needs. (The in-memory counters in `server/llm/index.js` stay where they are:
+ * they are process-global and reset on restart, so they can report "what has
+ * this instance done since boot" but never "what did workspace X spend in
+ * June".)
+ *
+ * ## Cache hits are counted, but not charged
+ *
+ * `llm.complete()` serves repeat prompts from an in-process cache. A hit makes
+ * no API call and costs nothing, so it reaches `agent_runs` with
+ * `cost_usd_cents = 0` while keeping its original `input_tokens` /
+ * `output_tokens` — those record how much work the cache absorbed. A month with
+ * many tokens and little spend is therefore a well-cached month, not a
+ * mis-metered one; do NOT "repair" it by re-deriving cost from token counts.
+ *
+ * This is the cost-based reading of usage — we bill for money that left the
+ * building, not for value delivered. Switching to a usage-based reading is a
+ * pricing decision, and it belongs in `llm.complete()` (which is the only place
+ * that knows a response was cached), not in this aggregation.
+ *
+ * The in-memory counters track the same hits in their own `stats.cached`
+ * bucket, so the two meters reconcile rather than merely differ: money matches
+ * outright, and tokens match once `stats.cached` is added to the per-provider
+ * totals. See the `stats` comment in `server/llm/index.js`.
+ *
+ * ## Why the month bucketing happens in JS
+ *
+ * Month truncation is the one place where the two dialects have no common
+ * spelling: SQLite has `strftime('%Y-%m', ...)`, Postgres has
+ * `date_trunc('month', ...)`, and neither understands the other. Rather than
+ * branch on `usePostgres`, we select the raw `started_at` values with a
+ * JS-computed cutoff parameter (the same trick `roi-dashboard.js` uses for its
+ * 30-day window) and bucket in JS. The SQL that reaches the driver is then
+ * plain `WHERE workspace_id = ? AND started_at >= ?` — identical on both.
+ *
+ * The two drivers hand `started_at` back in different shapes, which is the
+ * only dialect-awareness left, and it lives in `monthKey()`:
+ *   - better-sqlite3 → a string, `"YYYY-MM-DD HH:MM:SS"` (the column default is
+ *     `CURRENT_TIMESTAMP`, which SQLite renders in UTC)
+ *   - pg            → a JS `Date`
+ * Both are UTC, so both bucket to the same month.
+ */
+
+const DEFAULT_MONTHS = 6;
+const MAX_MONTHS = 24;
+
+// Hard ceiling on rows pulled into memory for one aggregation. A workspace
+// window will never come close; the cross-workspace admin view theoretically
+// could. Ordered newest-first so the truncation drops the oldest month, not
+// the one someone is actually looking at.
+const MAX_ROWS = 50000;
+
+/** Clamp `?months=` to [1, MAX_MONTHS], defaulting when absent or garbage. */
+function normalizeMonths(value) {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MONTHS;
+  return Math.min(n, MAX_MONTHS);
+}
+
+/** `YYYY-MM` for a UTC month offset from `now`. */
+function formatMonth(year, monthIndex) {
+  return `${year}-${String(monthIndex + 1).padStart(2, '0')}`;
+}
+
+/**
+ * The list of `YYYY-MM` buckets in the window, oldest first. `months: 6` means
+ * the current (partial) month plus the five before it.
+ */
+function monthList(months, now = new Date()) {
+  const out = [];
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  for (let i = months - 1; i >= 0; i--) {
+    const d = new Date(Date.UTC(y, m - i, 1));
+    out.push(formatMonth(d.getUTCFullYear(), d.getUTCMonth()));
+  }
+  return out;
+}
+
+/**
+ * The `started_at >= ?` cutoff: midnight UTC on the first day of the oldest
+ * month in the window.
+ *
+ * Formatted as `"YYYY-MM-DD HH:MM:SS"` to match SQLite's `CURRENT_TIMESTAMP`
+ * layout — the comparison there is a lexical string compare, so the formats
+ * have to line up. Rows written from JS with `toISOString()` use `T` instead of
+ * a space; that still compares correctly here because the cutoff is always
+ * midnight, so any row on or after the boundary date differs before the
+ * separator or sorts after it (`'T'` > `' '`). Postgres reads the same string
+ * as a plain timestamp literal.
+ */
+function windowCutoff(months, now = new Date()) {
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - (months - 1), 1));
+  return d.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/**
+ * Bucket one `started_at` value into `YYYY-MM`, whichever shape the driver
+ * returned it in. Returns null for unparseable input so a single bad row can't
+ * take down the whole report.
+ */
+function monthKey(value) {
+  if (value == null) return null;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime())
+      ? null
+      : formatMonth(value.getUTCFullYear(), value.getUTCMonth());
+  }
+  const s = String(value);
+  // Both "YYYY-MM-DD HH:MM:SS" and "YYYY-MM-DDTHH:MM:SS.sssZ" start with the
+  // UTC calendar date, so slicing the prefix is exact. Deliberately NOT
+  // `new Date(s)`: Node parses the space-separated form as *local* time, which
+  // silently moves rows across the month boundary in any non-UTC timezone.
+  const m = /^(\d{4})-(\d{2})/.exec(s);
+  if (m) return `${m[1]}-${m[2]}`;
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : formatMonth(d.getUTCFullYear(), d.getUTCMonth());
+}
+
+const asInt = (v) => {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : 0;
+};
+
+function emptyBucket(extra) {
+  return { runs: 0, input_tokens: 0, output_tokens: 0, usd_cents: 0, ...extra };
+}
+
+function addRun(bucket, row) {
+  bucket.runs += 1;
+  bucket.input_tokens += asInt(row.input_tokens);
+  bucket.output_tokens += asInt(row.output_tokens);
+  bucket.usd_cents += asInt(row.cost_usd_cents);
+}
+
+/**
+ * Fold raw `agent_runs` rows into the month × agent grid plus marginals.
+ *
+ * Every run counts as a call, including failed ones: an agent that errored
+ * after burning 40k input tokens still cost money, and an agent that errored
+ * before calling the LLM contributes zero to the token columns anyway (the
+ * error path leaves `cost_usd_cents` / `*_tokens` at their DEFAULT 0).
+ */
+function summarize(rows, months, groupBy = null) {
+  const cells = new Map();     // "month\u0000agent" → bucket
+  const byMonth = new Map();
+  const byAgent = new Map();
+  const byGroup = groupBy ? new Map() : null;
+  const total = emptyBucket();
+
+  for (const row of rows) {
+    const month = monthKey(row.started_at);
+    if (!month) continue;
+    const agent = row.agent_id || 'unknown';
+
+    const cellKey = `${month}\u0000${agent}`;
+    if (!cells.has(cellKey)) cells.set(cellKey, emptyBucket({ month, agent_id: agent }));
+    addRun(cells.get(cellKey), row);
+
+    if (!byMonth.has(month)) byMonth.set(month, emptyBucket({ month }));
+    addRun(byMonth.get(month), row);
+
+    if (!byAgent.has(agent)) byAgent.set(agent, emptyBucket({ agent_id: agent }));
+    addRun(byAgent.get(agent), row);
+
+    if (byGroup) {
+      const g = row[groupBy] || 'unknown';
+      if (!byGroup.has(g)) byGroup.set(g, emptyBucket({ [groupBy]: g }));
+      addRun(byGroup.get(g), row);
+    }
+
+    addRun(total, row);
+  }
+
+  // Zero-fill every month in the window so the chart has no phantom gaps and
+  // an empty workspace still renders an axis instead of nothing.
+  const monthly = months.map(m => byMonth.get(m) || emptyBucket({ month: m }));
+
+  const result = {
+    months,
+    rows: [...cells.values()].sort(
+      (a, b) => a.month.localeCompare(b.month) || b.usd_cents - a.usd_cents || a.agent_id.localeCompare(b.agent_id)
+    ),
+    byMonth: monthly,
+    byAgent: [...byAgent.values()].sort(
+      (a, b) => b.usd_cents - a.usd_cents || b.runs - a.runs || a.agent_id.localeCompare(b.agent_id)
+    ),
+    total,
+  };
+  if (byGroup) {
+    result[`by${groupBy === 'workspace_id' ? 'Workspace' : groupBy}`] =
+      [...byGroup.values()].sort((a, b) => b.usd_cents - a.usd_cents || b.runs - a.runs);
+  }
+  return result;
+}
+
+const SELECT_COLUMNS = 'agent_id, started_at, cost_usd_cents, input_tokens, output_tokens';
+
+/**
+ * Usage for one workspace, bucketed by month and agent.
+ *
+ * @param {object} opts
+ * @param {string} opts.workspaceId  required — this is a tenant-scoped report
+ * @param {string|number} [opts.months]  window size, clamped to [1, 24]
+ * @param {string} [opts.agentId]    optional single-agent filter
+ * @param {Date}   [opts.now]        test seam
+ * @param {object} deps  { query } — pass `scoped(workspaceId)` from a route
+ */
+async function getWorkspaceUsage({ workspaceId, months, agentId, now = new Date() }, deps) {
+  if (!workspaceId) throw new Error('getWorkspaceUsage requires a workspaceId');
+  const windowMonths = normalizeMonths(months);
+  const cutoff = windowCutoff(windowMonths, now);
+
+  let sql = `SELECT ${SELECT_COLUMNS} FROM agent_runs WHERE workspace_id = ? AND started_at >= ?`;
+  const params = [workspaceId, cutoff];
+  if (agentId) {
+    sql += ' AND agent_id = ?';
+    params.push(agentId);
+  }
+  sql += ' ORDER BY started_at DESC LIMIT ?';
+  params.push(MAX_ROWS);
+
+  const res = await deps.query(sql, params);
+  const raw = res.rows || [];
+  return {
+    workspace_id: workspaceId,
+    window: { months: windowMonths, from: cutoff, agent_id: agentId || null },
+    truncated: raw.length >= MAX_ROWS,
+    ...summarize(raw, monthList(windowMonths, now)),
+  };
+}
+
+/**
+ * Platform-wide usage across every workspace, for capacity and cost planning.
+ * Same aggregation, plus a per-workspace marginal. Platform-admin only — this
+ * deliberately reads across tenant boundaries, which is why it does NOT go
+ * through `scoped()`.
+ */
+async function getPlatformUsage({ months, agentId, now = new Date() }, deps) {
+  const windowMonths = normalizeMonths(months);
+  const cutoff = windowCutoff(windowMonths, now);
+
+  let sql = `SELECT workspace_id, ${SELECT_COLUMNS} FROM agent_runs WHERE started_at >= ?`;
+  const params = [cutoff];
+  if (agentId) {
+    sql += ' AND agent_id = ?';
+    params.push(agentId);
+  }
+  sql += ' ORDER BY started_at DESC LIMIT ?';
+  params.push(MAX_ROWS);
+
+  const res = await deps.query(sql, params);
+  const raw = res.rows || [];
+  return {
+    window: { months: windowMonths, from: cutoff, agent_id: agentId || null },
+    truncated: raw.length >= MAX_ROWS,
+    ...summarize(raw, monthList(windowMonths, now), 'workspace_id'),
+  };
+}
+
+module.exports = {
+  getWorkspaceUsage,
+  getPlatformUsage,
+  // exported for tests
+  monthKey,
+  monthList,
+  windowCutoff,
+  normalizeMonths,
+  DEFAULT_MONTHS,
+  MAX_MONTHS,
+};

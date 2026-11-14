@@ -1,0 +1,63 @@
+{
+  "name": "influencex",
+  "version": "1.0.0",
+  "description": "InfluenceX - KOL Marketing Automation Agent",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js",
+    "build": "cd client && npm install && npx vite build",
+    "dev:client": "cd client && npx vite",
+    "test": "node --test server/__tests__/*.test.js",
+    "test:watch": "node --test --watch server/__tests__/*.test.js",
+    "test:e2e": "playwright test --config e2e/playwright.config.js",
+    "test:e2e:ui": "playwright test --config e2e/playwright.config.js --ui",
+    "seed": "node server/seed-demo.js",
+    "rotate-mailbox-key": "node server/scripts/rotate-mailbox-key.js"
+  },
+  "keywords": [
+    "kol",
+    "influencer-marketing",
+    "creator-economy",
+    "youtube",
+    "tiktok",
+    "crm",
+    "automation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oratis/influencex.git"
+  },
+  "homepage": "https://github.com/oratis/influencex",
+  "bugs": {
+    "url": "https://github.com/oratis/influencex/issues"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "@google-analytics/data": "^5.2.1",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/auto-instrumentations-node": "^0.73.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.215.0",
+    "@opentelemetry/sdk-node": "^0.215.0",
+    "@sentry/node": "^9.47.1",
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^12.8.0",
+    "bullmq": "^5.76.2",
+    "compression": "^1.8.1",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.0",
+    "express": "^5.2.1",
+    "ioredis": "^5.10.1",
+    "nodemailer": "^8.0.4",
+    "pg": "^8.13.0",
+    "resend": "^6.10.0",
+    "stripe": "^22.0.2",
+    "undici": "^8.0.0",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1"
+  }
+}
