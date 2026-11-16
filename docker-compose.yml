@@ -1,0 +1,16 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      BASE_PATH: ""
+      SQLITE_DB_PATH: /data/influencex.db
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - influencex_data:/data
+volumes:
+  influencex_data:

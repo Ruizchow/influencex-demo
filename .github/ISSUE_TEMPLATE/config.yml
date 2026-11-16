@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Setup and login help
+    url: https://github.com/Ruizchow/influencex-demo/blob/main/docs/DEPLOYMENT.md
+    about: Check deployment steps and admin-account troubleshooting first.

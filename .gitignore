@@ -1,0 +1,69 @@
+# Dependencies. No trailing slash: with one, the pattern matches only real
+# directories, so a `node_modules` SYMLINK (what you get when sharing installs
+# between git worktrees) slips past it and can be committed — see the
+# accompanying commit for what that broke.
+node_modules
+client/node_modules
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Build output
+client/dist/
+dist/
+build/
+
+# Playwright (e2e/playwright.config.js writes both under e2e/)
+e2e/playwright-report/
+e2e/test-results/
+playwright/.cache/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local preview screenshots (not part of the application)
+calendar-working.png
+local-preview.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Credentials
+*.pem
+*.key
+ga4-*.json
+service-account*.json
+
+# Cloud
+.gcloudignore
+
+# Temporary
+tmp/
+temp/
+.cache/
+
+# Claude Code session state
+.claude/scheduled_tasks.lock
+.claude/*.lock
+
+# Generated Vite config cache
+*.timestamp-*.mjs
